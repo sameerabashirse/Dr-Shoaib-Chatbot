@@ -23,6 +23,13 @@ function verifyMetaSignature(rawBody, signatureHeader, secret = config.whatsapp.
   return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(received));
 }
 
+function verifyWebhookToken(receivedToken, expectedToken = config.whatsapp.verifyToken) {
+  const received = Buffer.from(String(receivedToken || "").trim());
+  const expected = Buffer.from(String(expectedToken || "").trim());
+  if (!received.length || received.length !== expected.length) return false;
+  return crypto.timingSafeEqual(received, expected);
+}
+
 function graphUrl(path) {
   return `https://graph.facebook.com/${config.whatsapp.graphVersion}/${path}`;
 }
@@ -232,6 +239,7 @@ function extractWebhookMessages(body) {
 module.exports = {
   isWhatsAppConfigured,
   verifyMetaSignature,
+  verifyWebhookToken,
   sendText,
   sendReplyButtons,
   sendInteractiveList,

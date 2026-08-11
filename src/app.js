@@ -56,7 +56,13 @@ function createApp() {
   }));
   app.use(express.urlencoded({ extended: false, limit: "10mb" }));
   app.use(cookieParser(config.cookieSecret));
-  app.use(mongoSanitize());
+  const sanitizeRequest = mongoSanitize();
+  app.use((req, res, next) => {
+    // Meta requires dotted query parameter names for webhook verification.
+    // The route performs no database query and validates the token itself.
+    if (req.method === "GET" && req.path === "/api/whatsapp/webhook") return next();
+    return sanitizeRequest(req, res, next);
+  });
   app.use(strictOrigin);
   app.use("/api", apiLimiter);
 

@@ -96,7 +96,7 @@ const config = {
     accessToken: read("WHATSAPP_ACCESS_TOKEN"),
     phoneNumberId: read("WHATSAPP_PHONE_NUMBER_ID"),
     businessAccountId: read("WHATSAPP_BUSINESS_ACCOUNT_ID"),
-    verifyToken: read("WHATSAPP_VERIFY_TOKEN"),
+    verifyToken: read("WHATSAPP_VERIFY_TOKEN").trim(),
     metaAppSecret: read("META_APP_SECRET"),
     templates: {
       appointmentConfirmation: read("WHATSAPP_TEMPLATE_APPOINTMENT_CONFIRMATION"),

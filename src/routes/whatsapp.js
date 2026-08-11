@@ -3,6 +3,7 @@ const { z } = require("zod");
 const { config } = require("../config/env");
 const {
   verifyMetaSignature,
+  verifyWebhookToken,
   extractWebhookMessages,
   updateDeliveryStatus,
   logIncomingMessage,
@@ -30,10 +31,12 @@ function validate(schema, body) {
 
 // Meta Webhook Verification
 router.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === config.whatsapp.verifyToken) {
+  // express-mongo-sanitize replaces dots in query keys with underscores.
+  // Accept both Meta's original names and their sanitized equivalents.
+  const mode = req.query["hub.mode"] || req.query.hub_mode;
+  const token = req.query["hub.verify_token"] || req.query.hub_verify_token;
+  const challenge = req.query["hub.challenge"] || req.query.hub_challenge;
+  if (mode === "subscribe" && verifyWebhookToken(token)) {
     return res.status(200).send(challenge);
   }
   return res.sendStatus(403);
