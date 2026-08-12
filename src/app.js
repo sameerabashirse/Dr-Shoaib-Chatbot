@@ -86,15 +86,28 @@ function createApp() {
   app.use("/api/patients", require("./routes/patients"));
   app.use("/api/reminders", require("./routes/reminders"));
 
-  app.use(express.static(rootDir, {
-    index: false,
-    setHeaders(res) {
-      res.setHeader("Cache-Control", "no-store");
-    }
-  }));
+  const publicFiles = new Map([
+    ["/", "index.html"],
+    ["/index.html", "index.html"],
+    ["/style.css", "style.css"],
+    ["/api-client.js", "api-client.js"],
+    ["/script.js", "script.js"]
+  ]);
+
+  app.get(Array.from(publicFiles.keys()), (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(path.join(rootDir, publicFiles.get(req.path) || "index.html"));
+  });
 
   app.get("*", (req, res, next) => {
     if (req.path.startsWith("/api")) return next();
+    let decodedPath;
+    try { decodedPath = decodeURIComponent(req.path); }
+    catch { return next(); }
+    const segments = decodedPath.split("/").filter(Boolean);
+    const reserved = new Set(["src", "scripts", "tests", "docs", "node_modules", "private-storage", "logs", "dump", "backups"]);
+    if (segments.some((segment) => segment.startsWith(".")) || reserved.has(String(segments[0] || "").toLowerCase())) return next();
+    if (path.extname(decodedPath)) return next();
     res.sendFile(path.join(rootDir, "index.html"));
   });
 

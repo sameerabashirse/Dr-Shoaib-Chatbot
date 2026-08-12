@@ -20,6 +20,9 @@ test("interactive button IDs are parsed independently from titles", () => { cons
 test("interactive list IDs are parsed", () => { const x = extractWebhookMessages({ entry: [{ changes: [{ value: { messages: [{ id: "wamid.2", from: "923001234567", type: "interactive", interactive: { list_reply: { id: "LOCATION_BWP", title: "Iqbal Hospital" } } }] } }] }] }).messages[0]; assert.equal(x.replyId, "LOCATION_BWP"); });
 test("media IDs are parsed", () => { const x = extractWebhookMessages({ entry: [{ changes: [{ value: { messages: [{ id: "wamid.3", from: "923001234567", type: "image", image: { id: "media-1" } }] } }] }] }).messages[0]; assert.equal(x.mediaId, "media-1"); });
 test("webhook signatures are verified", () => { const crypto = require("node:crypto"); const body = Buffer.from('{"test":true}'); const signature = `sha256=${crypto.createHmac("sha256", "secret").update(body).digest("hex")}`; assert.equal(verifyMetaSignature(body, signature, "secret"), true); assert.equal(verifyMetaSignature(body, signature, "wrong"), false); });
+test("webhook delivery fails closed when the Meta app secret is absent", () => {
+  assert.equal(verifyMetaSignature(Buffer.from("{}"), "sha256=invalid", ""), false);
+});
 test("webhook verification tokens tolerate surrounding whitespace but reject empty or incorrect values", () => {
   assert.equal(verifyWebhookToken("  correct-token\r\n", "correct-token"), true);
   assert.equal(verifyWebhookToken("wrong-token", "correct-token"), false);
@@ -38,6 +41,15 @@ test("Meta dotted verification query bypasses sanitization and returns only the 
     assert.equal(await accepted.text(), "123456");
     const denied = await fetch(`${endpoint}?hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=123456`);
     assert.equal(denied.status, 403);
+    const invalidDelivery = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-hub-signature-256": "sha256=invalid" },
+      body: "{}"
+    });
+    assert.equal(invalidDelivery.status, 403);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/server.js`)).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/src/config/env.js`)).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/package.json`)).status, 404);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     config.whatsapp.verifyToken = originalToken;

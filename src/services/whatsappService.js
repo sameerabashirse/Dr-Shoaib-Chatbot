@@ -12,7 +12,9 @@ function isWhatsAppConfigured() {
 }
 
 function verifyMetaSignature(rawBody, signatureHeader, secret = config.whatsapp.metaAppSecret) {
-  if (!secret) return !config.isProduction;
+  // Webhook delivery must always fail closed. Meta verification GET requests
+  // use the separate verify token and do not call this function.
+  if (!secret) return false;
   if (!signatureHeader || !signatureHeader.startsWith("sha256=")) return false;
   const expected = crypto
     .createHmac("sha256", secret)
