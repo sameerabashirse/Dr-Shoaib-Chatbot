@@ -217,7 +217,7 @@ function createConversationOrchestrator(deps = {}) {
       try {
         const location = await d.locationService.getBookableLocation(locationId);
         await save(session, "BOOKING_NAME", {
-          locationId: location.code,
+          locationId: String(location._id || location.code),
           locationName: `${location.clinicName}, ${location.city}`,
           district: location.city
         });
@@ -351,7 +351,7 @@ function createConversationOrchestrator(deps = {}) {
       const locationId = upperAction.startsWith("RESCHEDULE_LOCATION_") ? action.slice("RESCHEDULE_LOCATION_".length) : input;
       try {
         const location = await d.locationService.getBookableLocation(locationId);
-        await save(session, "RESCHEDULE_DATE", { ...session.context, locationId: location.code, locationName: `${location.clinicName}, ${location.city}` });
+        await save(session, "RESCHEDULE_DATE", { ...session.context, locationId: String(location._id || location.code), locationName: `${location.clinicName}, ${location.city}` });
         return dateMenu(session, "reschedule");
       } catch {
         return { body: "That clinic selection is invalid or unavailable. Type BACK or select an active clinic." };
