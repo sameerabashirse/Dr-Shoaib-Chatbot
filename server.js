@@ -3,9 +3,53 @@ const { connectDatabase } = require("./src/config/db");
 const { createApp } = require("./src/app");
 const { startReminderScheduler } = require("./src/services/reminderService");
 const { startOwnerEmailScheduler } = require("./src/services/ownerEmailOutboxService");
-const { StaffUser, ClinicLocation } = require("./src/models");
+const mongoose = require("mongoose");
+const { StaffUser, ClinicLocation, Appointment } = require("./src/models");
+
+async function migrateLegacyClinicLocationIds() {
+  const collection = ClinicLocation.collection;
+  const legacyLocations = await collection.find({
+    _id: { $type: "string" },
+    code: { $not: /^LEGACY_/ }
+  }).toArray();
+
+  for (const legacy of legacyLocations) {
+    const originalCode = String(legacy.code || "CLINIC").toUpperCase();
+    const archivedCode = `LEGACY_${originalCode}_${Date.now().toString(36).toUpperCase()}`;
+    const replacementId = new mongoose.Types.ObjectId();
+
+    await collection.updateOne(
+      { _id: legacy._id, code: legacy.code },
+      { $set: { code: archivedCode, isActive: false, bookingEnabled: false, updatedAt: new Date() } }
+    );
+
+    try {
+      await collection.insertOne({
+        ...legacy,
+        _id: replacementId,
+        code: originalCode,
+        updatedAt: new Date()
+      });
+      await Appointment.collection.updateMany(
+        { location: legacy._id },
+        { $set: { location: replacementId, updatedAt: new Date() } }
+      );
+    } catch (error) {
+      await collection.updateOne(
+        { _id: legacy._id, code: archivedCode },
+        { $set: { code: legacy.code, isActive: legacy.isActive, bookingEnabled: legacy.bookingEnabled } }
+      ).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  if (legacyLocations.length) {
+    console.log("Legacy clinic identifiers migrated safely.", { count: legacyLocations.length });
+  }
+}
 
 async function ensureInitialData() {
+  await migrateLegacyClinicLocationIds();
   if (config.isProduction) {
     await StaffUser.updateMany(
       { email: /@drsohaibdemo\.com$/i },
