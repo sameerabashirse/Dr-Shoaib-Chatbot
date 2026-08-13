@@ -74,7 +74,10 @@ function main() {
       })
       .catch((error) => {
         // Log error safely without terminating Express server process
-        console.error("Database background startup error:", error.stack || error);
+        console.error("Database background startup error.", {
+          name: error?.name || "DatabaseError",
+          code: error?.code || "DATABASE_STARTUP_FAILED"
+        });
       });
   });
 

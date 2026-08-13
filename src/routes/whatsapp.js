@@ -45,10 +45,16 @@ router.get("/webhook", (req, res) => {
 // Meta Webhook Delivery & Incoming
 router.post("/webhook", webhookLimiter, asyncHandler(async (req, res) => {
   if (!verifyMetaSignature(req.rawBody, req.get("x-hub-signature-256"))) {
+    console.warn("WhatsApp webhook rejected.", { requestId: req.requestId, reason: "invalid_signature" });
     throw forbidden("Invalid Meta webhook signature.");
   }
 
   const { messages, statuses } = extractWebhookMessages(req.body);
+  console.log("WhatsApp webhook accepted.", {
+    requestId: req.requestId,
+    messageCount: messages.length,
+    statusCount: statuses.length
+  });
   const pending = [];
   for (const status of statuses) pending.push(updateDeliveryStatus(status));
   for (const message of messages) {

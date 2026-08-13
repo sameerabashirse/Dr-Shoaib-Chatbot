@@ -10,10 +10,13 @@ async function connectDatabase() {
       autoIndex: !config.isProduction,
       serverSelectionTimeoutMS: 5000
     });
-    console.log("MongoDB connected to", config.mongoUri);
+    console.log("MongoDB connected successfully.");
   } catch (error) {
     if (config.isProduction || process.env.NODE_ENV === "production") {
-      console.error("Production MongoDB connection failed:", error.message || error);
+      console.error("Production MongoDB connection failed.", {
+        name: error?.name || "DatabaseError",
+        code: error?.code || "DATABASE_CONNECTION_FAILED"
+      });
       throw error;
     }
 
