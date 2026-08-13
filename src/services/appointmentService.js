@@ -162,7 +162,13 @@ async function createAppointment(input, options = {}) {
     }
 
     const { scheduleAppointmentReminders } = require("./reminderService");
-    await scheduleAppointmentReminders(appointment);
+    await scheduleAppointmentReminders(appointment).catch((error) => {
+      console.error("Appointment reminder scheduling failed.", {
+        appointmentId: appointment.appointmentId,
+        name: error?.name || "ReminderError",
+        code: error?.code || "REMINDER_SCHEDULING_FAILED"
+      });
+    });
 
     await audit({
       actorType: source === "staff" ? "staff" : "patient",
@@ -172,6 +178,12 @@ async function createAppointment(input, options = {}) {
       entityType: "appointment",
       entityId: appointment.appointmentId,
       req: options.req
+    }).catch((error) => {
+      console.error("Appointment audit logging failed.", {
+        appointmentId: appointment.appointmentId,
+        name: error?.name || "AuditError",
+        code: error?.code || "APPOINTMENT_AUDIT_FAILED"
+      });
     });
 
     return appointment;
