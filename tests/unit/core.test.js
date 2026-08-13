@@ -56,5 +56,11 @@ test("Meta dotted verification query bypasses sanitization and returns only the 
   }
 });
 test("language selection uses stable IDs", () => assert.deepEqual(languageMessage().buttons.map((x) => x.id), ["LANG_EN", "LANG_UR"]));
-test("main menu uses an interactive list", () => { const menu = mainMenu("en"); assert.equal(menu.kind, "list"); assert.equal(menu.sections[0].rows.length, 6); });
+test("main menu uses a professional interactive list", () => {
+  const menu = mainMenu("en");
+  assert.equal(menu.kind, "list");
+  assert.equal(menu.sections[0].rows.length, 7);
+  assert.deepEqual(menu.sections[0].rows.slice(0, 3).map((row) => row.id), ["MENU_BOOK", "MENU_MANAGE", "MENU_UPLOAD"]);
+  assert.ok(menu.sections[0].rows.every((row) => row.title.length <= 24));
+});
 test("Urdu booking content does not fall back to English", () => assert.match(tr("ur", "name"), /[\u0600-\u06FF]/));

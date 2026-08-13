@@ -20,7 +20,10 @@ function validatePassword(password) {
 }
 
 async function setupRequired() {
-  const count = await StaffUser.countDocuments();
+  const filter = config.isProduction
+    ? { isActive: true, email: { $not: /@drsohaibdemo\.com$/i } }
+    : {};
+  const count = await StaffUser.countDocuments(filter);
   return count === 0;
 }
 
@@ -81,7 +84,11 @@ function clearRefreshCookie(res) {
 }
 
 async function login({ email, password }, req, res) {
-  const user = await StaffUser.findOne({ email: String(email || "").toLowerCase() }).select("+passwordHash");
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (config.isProduction && /@drsohaibdemo\.com$/i.test(normalizedEmail)) {
+    throw unauthorized("Invalid email or password.");
+  }
+  const user = await StaffUser.findOne({ email: normalizedEmail }).select("+passwordHash");
   if (!user || !user.isActive) throw unauthorized("Invalid email or password.");
 
   if (user.lockUntil && user.lockUntil > new Date()) {

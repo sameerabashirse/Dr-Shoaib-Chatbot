@@ -4,30 +4,13 @@ const { createApp } = require("./src/app");
 const { startReminderScheduler } = require("./src/services/reminderService");
 const { startOwnerEmailScheduler } = require("./src/services/ownerEmailOutboxService");
 const { StaffUser, ClinicLocation } = require("./src/models");
-const bcrypt = require("bcryptjs");
 
 async function ensureInitialData() {
-  const staffCount = await StaffUser.countDocuments();
-  if (staffCount === 0) {
-    const passwordHashAdmin = await bcrypt.hash("Admin@123", 10);
-    const passwordHashDoctor = await bcrypt.hash("Doctor@123", 10);
-    const passwordHashReception = await bcrypt.hash("Reception@123", 10);
-    const passwordHashStaff = await bcrypt.hash("Staff@123", 10);
-
-    const demoUsers = [
-      { name: "Super Admin", email: "admin@drsohaibdemo.com", passwordHash: passwordHashAdmin, role: "super_admin" },
-      { name: "Dr. Sohaib", email: "doctor@drsohaibdemo.com", passwordHash: passwordHashDoctor, role: "doctor" },
-      { name: "Bahawalpur Receptionist", email: "reception@drsohaibdemo.com", passwordHash: passwordHashReception, role: "receptionist" },
-      { name: "Clinic Staff", email: "staff@drsohaibdemo.com", passwordHash: passwordHashStaff, role: "clinic_staff" }
-    ];
-
-    for (const user of demoUsers) {
-      await StaffUser.updateOne(
-        { email: user.email },
-        { $setOnInsert: user },
-        { upsert: true }
-      );
-    }
+  if (config.isProduction) {
+    await StaffUser.updateMany(
+      { email: /@drsohaibdemo\.com$/i },
+      { $set: { isActive: false } }
+    );
   }
 
   const locationCount = await ClinicLocation.countDocuments();

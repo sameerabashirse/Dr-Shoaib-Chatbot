@@ -1256,10 +1256,10 @@
           </div>
           <form id="login-form">
             <label>Staff Email
-              <input type="email" name="email" value="admin@drsohaibdemo.com" required>
+              <input type="email" name="email" autocomplete="username" required>
             </label>
             <label>Password
-              <input type="password" name="password" value="Admin@123" required>
+              <input type="password" name="password" autocomplete="current-password" required>
             </label>
             <button class="primary-action wide-button" style="margin-top: 10px;" id="login-submit-btn">Login to Dashboard</button>
             <button type="button" class="header-button wide-button" id="login-back-patient" style="margin-top: 8px; color: var(--ink); border-color: var(--line);">Back to Patient Portal</button>
