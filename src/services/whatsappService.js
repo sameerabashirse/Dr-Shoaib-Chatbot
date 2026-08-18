@@ -51,6 +51,32 @@ function safeFailure(data, httpStatus) {
   };
 }
 
+async function downloadMetaMedia(mediaId, { maxBytes, allowedMimeTypes } = {}) {
+  if (!isWhatsAppConfigured()) throw new Error("WhatsApp Cloud API is not configured.");
+  if (!/^\d{5,40}$/.test(String(mediaId || ""))) throw new Error("Invalid WhatsApp media identifier.");
+  const metadataResponse = await metaFetch(graphUrl(`${mediaId}?fields=id,mime_type,file_size`), {
+    headers: { Authorization: `Bearer ${config.whatsapp.accessToken}` },
+    signal: AbortSignal.timeout(10000)
+  });
+  const metadata = await metadataResponse.json().catch(() => ({}));
+  if (!metadataResponse.ok || !metadata.url) throw new Error("WhatsApp media metadata could not be retrieved.");
+  const mimeType = String(metadata.mime_type || "").split(";")[0].trim().toLowerCase();
+  const fileSize = Number(metadata.file_size || 0);
+  if (allowedMimeTypes?.length && !allowedMimeTypes.includes(mimeType)) throw new Error("Unsupported WhatsApp media type.");
+  if (!Number.isSafeInteger(fileSize) || fileSize <= 0 || (maxBytes && fileSize > maxBytes)) throw new Error("WhatsApp media size is invalid.");
+
+  const mediaResponse = await metaFetch(metadata.url, {
+    headers: { Authorization: `Bearer ${config.whatsapp.accessToken}` },
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!mediaResponse.ok) throw new Error("WhatsApp media could not be downloaded.");
+  const contentLength = Number(mediaResponse.headers?.get?.("content-length") || 0);
+  if (maxBytes && contentLength > maxBytes) throw new Error("WhatsApp media exceeds the allowed size.");
+  const buffer = Buffer.from(await mediaResponse.arrayBuffer());
+  if (!buffer.length || buffer.length !== fileSize || (maxBytes && buffer.length > maxBytes)) throw new Error("WhatsApp media download was incomplete.");
+  return { buffer, mimeType, fileSize };
+}
+
 async function ensureSession(phoneE164, update = {}) {
   return ConversationSession.findOneAndUpdate(
     { phoneE164 },
@@ -224,6 +250,20 @@ async function sendInteractiveList(to, body, buttonText, sections, options = {})
   return sendWhatsAppRequest(payload, phoneE164, body, options);
 }
 
+async function sendMediaById(to, mediaType, mediaId, caption = "") {
+  if (!["audio", "video"].includes(mediaType)) throw new Error("Unsupported welcome media type.");
+  if (!/^\d{5,40}$/.test(String(mediaId || ""))) throw new Error("Invalid welcome media identifier.");
+  const phoneE164 = normalizePhone(to);
+  const media = { id: String(mediaId) };
+  if (caption && mediaType === "video") media.caption = String(caption).slice(0, 1024);
+  return sendWhatsAppRequest(
+    { messaging_product: "whatsapp", to: phoneE164.replace("+", ""), type: mediaType, [mediaType]: media },
+    phoneE164,
+    caption || "Doctor welcome message",
+    { senderType: "ai" }
+  );
+}
+
 async function markMessageAsRead(metaMessageId) {
   if (!isWhatsAppConfigured() || !metaMessageId) return { status: "failed" };
   try {
@@ -347,7 +387,9 @@ function extractWebhookMessages(body) {
         body: text,
         replyId: message.interactive?.button_reply?.id || message.interactive?.list_reply?.id || message.button?.payload || "",
         replyTitle: message.interactive?.button_reply?.title || message.interactive?.list_reply?.title || message.button?.text || "",
-        mediaId: message.image?.id || message.document?.id || message.audio?.id || message.video?.id || message.sticker?.id || ""
+        mediaId: message.image?.id || message.document?.id || message.audio?.id || message.video?.id || message.sticker?.id || "",
+        filename: String(message.document?.filename || "").slice(0, 255),
+        mimeType: String(message.document?.mime_type || message.image?.mime_type || message.audio?.mime_type || "").slice(0, 100)
       });
     }
   }
@@ -361,6 +403,7 @@ module.exports = {
   sendText,
   sendReplyButtons,
   sendInteractiveList,
+  sendMediaById,
   sendTemplate,
   markMessageAsRead,
   isServiceWindowOpen,
@@ -368,5 +411,6 @@ module.exports = {
   logIncomingMessage,
   updateDeliveryStatus,
   extractWebhookMessages,
+  downloadMetaMedia,
   setMetaFetchForTests
 };

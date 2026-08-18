@@ -63,20 +63,35 @@ async function findOrCreatePatient(input) {
   const phoneE164 = normalizePhone(input.phone);
   if (!phoneE164) throw badRequest("A valid phone number is required.");
 
+  const existing = await Patient.findOne({ phoneE164 });
+  const preservePrimary = existing && input.patientFor === "family";
   const update = {
     $set: {
-      fullName: input.fullName,
-      age: input.age,
+      fullName: preservePrimary ? existing.fullName : input.fullName,
+      age: preservePrimary ? existing.age : input.age,
       gender: input.gender || "not_provided",
       preferredLanguage: input.preferredLanguage || "en"
     }
   };
   try {
-    return await Patient.findOneAndUpdate(
+    const patient = await Patient.findOneAndUpdate(
       { phoneE164 },
       update,
       { new: true, upsert: true, runValidators: true }
     );
+    if (input.patientFor && input.fullName) {
+      const normalizedName = String(input.fullName).trim().toLocaleLowerCase("en");
+      patient.knownProfiles = (patient.knownProfiles || []).filter((profile) => profile.normalizedName !== normalizedName).slice(-19);
+      patient.knownProfiles.push({
+        normalizedName,
+        fullName: String(input.fullName).trim(),
+        ...(Number.isInteger(input.age) ? { age: input.age } : {}),
+        relationship: input.patientFor,
+        lastVerifiedAt: new Date()
+      });
+      await patient.save();
+    }
+    return patient;
   } catch (error) {
     if (error.code !== 11000) throw error;
     return Patient.findOneAndUpdate({ phoneE164 }, update, { new: true, runValidators: true });

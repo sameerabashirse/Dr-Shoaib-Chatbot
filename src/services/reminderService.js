@@ -1,8 +1,9 @@
 const cron = require("node-cron");
-const { Appointment, ReminderJob } = require("../models");
+const { Appointment, ReminderJob, ClinicLocation } = require("../models");
 const { appointmentDateTime } = require("../utils/time");
 const { getClinicSettings } = require("./settingsService");
-const { sendAppointmentReminder } = require("./appointmentNotificationService");
+const { sendAppointmentReminder, sendArrivalUpdate } = require("./appointmentNotificationService");
+const { config } = require("../config/env");
 const { sendText } = require("./whatsappService");
 const { OCCUPYING_APPOINTMENT_STATUSES } = require("../domain/appointmentRules");
 const { audit } = require("./auditService");
@@ -63,6 +64,21 @@ async function scheduleAppointmentReminders(appointment) {
     scheduled.push(job);
   }
 
+  if (config.whatsapp.templates.arrivalUpdate) {
+    const dueAt = appointmentAt.minus({ minutes: 60 }).toJSDate();
+    if (dueAt > now) {
+      const arrival = await ReminderJob.findOneAndUpdate(
+        { dedupeKey: `arrival:${appointment._id}:${scheduleRevision}` },
+        { $setOnInsert: {
+          appointment: appointment._id, patient: appointment.patient, phoneE164: appointment.phoneE164,
+          type: "arrival_update", dueAt, message: `Arrival update for ${appointment.appointmentId}`,
+          status: "pending", attempts: 0, scheduleRevision
+        } },
+        { upsert: true, new: true, setDefaultsOnInsert: true, runValidators: true }
+      );
+    }
+  }
+
   await Appointment.updateOne(
     { _id: appointment._id },
     { $set: { reminderStatus: scheduled.length ? "pending" : "not_scheduled" } }
@@ -100,6 +116,17 @@ async function deliverReminder(job) {
   if (job.type === "follow_up_reminder") return sendText(job.phoneE164, job.message);
   if (!job.appointment || !OCCUPYING_APPOINTMENT_STATUSES.includes(job.appointment.status)) {
     return { status: "cancelled", error: "Appointment is no longer active." };
+  }
+  if (job.type === "arrival_update") {
+    const location = await ClinicLocation.findById(job.appointment.location).select("currentDelayMinutes").lean();
+    const delayMinutes = Number(location?.currentDelayMinutes || 0);
+    const appointmentAt = appointmentDateTime(
+      job.appointment.date,
+      job.appointment.time,
+      job.appointment.slotTimezone || job.appointment.locationSnapshot?.timezone
+    );
+    const arrivalTime = appointmentAt.minus({ minutes: 15 }).plus({ minutes: delayMinutes }).toFormat("hh:mm a");
+    return sendArrivalUpdate(job.appointment, { arrivalTime, delayMinutes });
   }
   return sendAppointmentReminder(job.appointment);
 }

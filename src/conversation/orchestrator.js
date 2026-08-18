@@ -1,393 +1,280 @@
+const { DateTime } = require("luxon");
 const models = require("../models");
-const appointmentService = require("../services/appointmentService");
-const availabilityService = require("../services/availabilityService");
-const locationService = require("../services/locationService");
-const appointmentNotificationService = require("../services/appointmentNotificationService");
+const { config } = require("../config/env");
 const { normalizePhone } = require("../utils/security");
-const { tr } = require("./translations");
-const msg = require("./messages");
-const { OCCUPYING_APPOINTMENT_STATUSES: ACTIVE_STATUSES } = require("../domain/appointmentRules");
-const { logError } = require("../utils/safeLogger");
+const { normalizeTime } = require("../utils/time");
+const { createConciergeTools } = require("../services/conciergeTools");
+const { understandPatientMessage, emergencyPattern, unsafeMedicalPattern } = require("../services/conciergeUnderstandingService");
+const { sendMediaById } = require("../services/whatsappService");
 
-const consultationReasons = [
-  "General Consultation",
-  "Joint & Bone Pain",
-  "Knee Joint Assessment",
-  "Back / Spine Pain",
-  "Shoulder Stiffness & Pain",
-  "Sports Injury & Ligament Strain",
-  "Trauma / Fracture Check",
-  "Post-Operation Follow-up",
-  "Medical Report Review",
-  "Prefer not to say"
-];
+const reply = {
+  text: (body) => ({ kind: "text", body }),
+  buttons: (body, buttons) => ({ kind: "buttons", body, buttons })
+};
+
+function language(value) { return value === "ur" ? "ur" : value === "roman_ur" ? "roman_ur" : "en"; }
+
+function resolveDate(value, timezone = config.clinicTimezone) {
+  const input = String(value || "").trim().toLowerCase();
+  const today = DateTime.now().setZone(timezone).startOf("day");
+  const iso = DateTime.fromISO(input, { zone: timezone });
+  if (/^\d{4}-\d{2}-\d{2}$/.test(input) && iso.isValid && iso >= today) return iso.toISODate();
+  if (/^(today|aaj|aj)$/.test(input)) return today.toISODate();
+  if (/^(tomorrow|kal)$/.test(input)) return today.plus({ days: 1 }).toISODate();
+  const weekdays = { monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6, sunday: 7 };
+  if (weekdays[input]) {
+    let date = today;
+    while (date.weekday !== weekdays[input]) date = date.plus({ days: 1 });
+    return date.toISODate();
+  }
+  return "";
+}
+
+function mergeFacts(context, facts) {
+  const next = { ...context };
+  const fields = { patientName: "fullName", age: "age", concern: "reason", clinic: "clinic", preferredDate: "preferredDate", preferredTime: "preferredTime", appointmentId: "appointmentId", reportsAvailable: "reportsAvailable", patientFor: "patientFor" };
+  for (const [source, target] of Object.entries(fields)) {
+    if (facts[source] !== null && facts[source] !== undefined && facts[source] !== "unknown") next[target] = facts[source];
+  }
+  next.language = language(facts.language || next.language);
+  return next;
+}
+
+function visitSummary(context) {
+  const age = Number.isInteger(context.age) ? `, ${context.age}` : "";
+  return `Visit Summary\nPatient: ${context.fullName}${age}\nConcern: ${context.reason}\nReports: ${context.wantsReports ? "To be attached after confirmation" : "None shared"}\nAppointment: ${context.date}, ${context.time}\nClinic: ${context.locationName}\n\nPatient-provided information only — not an AI diagnosis.`;
+}
 
 function createConversationOrchestrator(deps = {}) {
-  const d = { models, appointmentService, availabilityService, locationService, appointmentNotificationService, ...deps };
-
-  async function save(session, state, context = session.context || {}) {
-    session.state = state;
-    session.context = context;
-    session.lastMessageAt = new Date();
-    await session.save();
+  const d = { models: deps.models || models, tools: deps.tools || createConciergeTools(deps), understand: deps.understand || understandPatientMessage, sendMedia: deps.sendMedia || sendMediaById };
+  async function save(session, state, context = session.context || {}) { session.state = state; session.context = context; session.lastMessageAt = new Date(); await session.save(); }
+  async function handoff(session, phone, reason) {
+    await d.tools.request_staff_handoff({ phone, reason });
+    session.aiPaused = true; session.humanRequired = true;
+    await save(session, "STAFF_HANDOFF", session.context || {});
+    return reply.text("I’m connecting you with the clinic receptionist for accurate assistance.");
+  }
+  async function clinicInformation() {
+    const locations = await d.tools.get_clinic_information({});
+    return reply.text(locations.map((item) => `${item.clinicName}, ${item.city}\n${item.fullAddress || "Address available from reception"}`).join("\n\n"));
+  }
+  async function chooseClinic(session, context) {
+    const locations = await d.tools.get_clinic_information({});
+    const active = locations.filter((item) => item.status === "Active" || item.status === "active" || (item.isActive && item.bookingEnabled));
+    const wanted = String(context.clinic || "").toLowerCase();
+    const selected = wanted
+      ? active.find((item) => [item.code, item.city, item.clinicName].some((value) => String(value || "").toLowerCase().includes(wanted)))
+      : active.length === 1 ? active[0] : null;
+    if (selected) return { ...context, locationId: String(selected._id || selected.code), locationName: `${selected.clinicName}, ${selected.city}` };
+    if (!active.length) return null;
+    await save(session, "BOOKING_CLINIC", context);
+    return reply.buttons("Which clinic would you prefer?", active.slice(0, 3).map((item) => ({ id: `AI_CLINIC_${item.code}`, title: String(item.city).slice(0, 20) })));
+  }
+  async function continueBooking(session, phone, context, messageId) {
+    let next = { ...context, phone };
+    if (!next.fullName) { await save(session, "BOOKING_NAME", next); return reply.text("What is the patient’s full name?"); }
+    if (!next.reason) { await save(session, "BOOKING_CONCERN", next); return reply.text("Briefly, what would you like Dr. Sohaib to check?"); }
+    const clinic = await chooseClinic(session, next);
+    if (!clinic) return handoff(session, phone, "No bookable clinic available");
+    if (clinic.body) return clinic;
+    next = clinic;
+    next.date = resolveDate(next.preferredDate || next.date);
+    if (!next.date) { await save(session, "BOOKING_DATE", next); return reply.text("Which day would you prefer?"); }
+    const slots = await d.tools.get_available_slots({ locationId: next.locationId, date: next.date });
+    if (!slots.length) { delete next.date; delete next.preferredDate; await save(session, "BOOKING_DATE", next); return reply.text("That day has no available appointment. Which other day would suit you?"); }
+    const wantedTime = normalizeTime(next.preferredTime || next.time);
+    if (wantedTime && slots.some((slot) => slot.time === wantedTime)) return askReports(session, { ...next, time: wantedTime });
+    await save(session, "BOOKING_TIME", { ...next, availableTimes: slots.slice(0, 3).map((slot) => slot.time), messageId });
+    return reply.buttons(`I found these available times on ${next.date}. Which suits you?`, slots.slice(0, 3).map((slot) => ({ id: `AI_TIME_${slot.time}`, title: slot.time })));
+  }
+  async function askReports(session, context) {
+    await save(session, "BOOKING_REPORTS", context);
+    return reply.buttons("Would you like to attach previous PDF, JPEG, or PNG medical reports for Dr. Sohaib?", [
+      { id: "AI_REPORTS_YES", title: "Upload Reports" }, { id: "AI_REPORTS_NO", title: "Continue Without" }
+    ]);
+  }
+  async function findActiveClinic() {
+    const locations = await d.tools.get_clinic_information({});
+    return locations.find((item) => item.status === "Active" || item.status === "active" || (item.isActive && item.bookingEnabled));
   }
 
-  async function activeAppointmentsFor(phone) {
-    return d.models.Appointment.find({ phoneE164: phone, status: { $in: ACTIVE_STATUSES } }).sort({ date: 1, time: 1 });
-  }
-
-  function withNavigation(rows) {
-    return [...rows, { id: "MENU_MAIN", title: "Main Menu" }];
-  }
-
-  async function locationMenu(session, mode = "booking") {
-    const locations = await d.locationService.listLocations({ bookableOnly: true });
-    if (!locations.length) return { body: "No clinic is currently accepting appointments. Please contact clinic staff." };
-    await save(session, mode === "booking" ? "BOOKING_LOCATION" : "RESCHEDULE_LOCATION", session.context || {});
-    return msg.list(
-      mode === "booking" ? "Select an active clinic for your appointment." : "Select the clinic for the rescheduled appointment.",
-      withNavigation(locations.slice(0, 9).map((location) => ({
-        id: `${mode === "booking" ? "BOOK_LOCATION" : "RESCHEDULE_LOCATION"}_${location.code}`,
-        title: `${location.city} - ${location.code}`.slice(0, 24),
-        description: location.clinicName.slice(0, 72)
-      }))),
-      "Select clinic"
-    );
-  }
-
-  async function dateMenu(session, mode, offset = 0) {
-    const context = session.context || {};
-    const dates = await d.availabilityService.getAvailableDates(context.locationId, 60);
-    if (!dates.length) return { body: "No appointment dates are currently available for this clinic. Type BACK or MENU." };
-    const page = dates.slice(offset, offset + 8);
-    const prefix = mode === "booking" ? "BOOK" : "RESCHEDULE";
-    const rows = page.map((entry) => ({
-      id: `${prefix}_DATE_${entry.date}`,
-      title: entry.date,
-      description: `${entry.availableSlots} available slot${entry.availableSlots === 1 ? "" : "s"}`
-    }));
-    if (dates.length > offset + 8) rows.push({ id: `${prefix}_DATES_MORE_${offset + 8}`, title: "More dates" });
-    rows.push({ id: "BACK", title: "Back" });
-    await save(session, mode === "booking" ? "BOOKING_DATE" : "RESCHEDULE_DATE", context);
-    return msg.list("Select an available appointment date.", rows, "Select date");
-  }
-
-  async function slotMenu(session, mode, offset = 0) {
-    const context = session.context || {};
-    const slots = await d.availabilityService.getAvailableSlots(context.locationId, context.date);
-    const available = slots.filter((slot) => slot.available);
-    if (!available.length) return { body: "That date no longer has an available slot. Type BACK to select another date." };
-    const page = available.slice(offset, offset + 8);
-    const prefix = mode === "booking" ? "BOOK" : "RESCHEDULE";
-    const rows = page.map((slot) => ({ id: `${prefix}_SLOT_${slot.time}`, title: slot.time, description: "Available" }));
-    if (available.length > offset + 8) rows.push({ id: `${prefix}_SLOTS_MORE_${offset + 8}`, title: "More times" });
-    rows.push({ id: "BACK", title: "Back" });
-    await save(session, mode === "booking" ? "BOOKING_TIME" : "RESCHEDULE_TIME", context);
-    return msg.list("Select an available appointment time.", rows, "Select time");
-  }
-
-  function appointmentSummary(appointment) {
-    return `Appointment ID: ${appointment.appointmentId}\nToken: ${appointment.tokenNumber}\nDate: ${appointment.date}\nTime: ${appointment.time}\nStatus: ${appointment.status}\nLocation: ${appointment.locationSnapshot?.clinicName || "Dr. Sohaib Clinic"}, ${appointment.locationSnapshot?.city || ""}`;
-  }
-
-  async function manageAppointment(session, phone, appointment) {
-    let selected = appointment;
-    if (!selected) {
-      const appointments = await activeAppointmentsFor(phone);
-      if (!appointments.length) {
-        await save(session, "LOOKUP_ID", {});
-        return { body: `${tr(session.language, "noAppointment")}\n\nEnter your appointment ID to look up another appointment, or type MENU.` };
-      }
-      selected = appointments[0];
-    }
-    await save(session, "MANAGE_APPOINTMENT", { appointmentId: selected.appointmentId });
-    return msg.list(
-      `Dr. Sohaib appointment:\n\n${appointmentSummary(selected)}`,
-      [
-        { id: `MANAGE_CANCEL_${selected.appointmentId}`, title: "Cancel Appointment" },
-        { id: `MANAGE_RESCHEDULE_${selected.appointmentId}`, title: "Reschedule" },
-        { id: "MANAGE_LOOKUP", title: "Lookup by ID" },
-        { id: "MENU_MAIN", title: "Main Menu" }
-      ],
-      "Appointment options"
-    );
-  }
-
-  async function bookingReview(session) {
-    const context = session.context || {};
-    await save(session, "BOOKING_REVIEW", context);
-    return msg.buttons(
-      `Review your appointment:\n\nPatient: ${context.fullName}\nClinic: ${context.locationName}\nDate: ${context.date}\nTime: ${context.time}\nReason: ${context.reason}\nConsent: Yes\n\nConfirm these details?`,
-      [
-        { id: "CONFIRM_BOOKING", title: "Confirm Booking" },
-        { id: "BACK", title: "Back" },
-        { id: "MENU_MAIN", title: "Main Menu" }
-      ]
-    );
-  }
-
-  async function rescheduleReview(session) {
-    const context = session.context || {};
-    await save(session, "RESCHEDULE_REVIEW", context);
-    return msg.buttons(
-      `Review the new appointment details:\n\nAppointment ID: ${context.appointmentId}\nClinic: ${context.locationName}\nDate: ${context.date}\nTime: ${context.time}\n\nConfirm rescheduling?`,
-      [
-        { id: "CONFIRM_RESCHEDULE", title: "Confirm" },
-        { id: "BACK", title: "Back" },
-        { id: "MENU_MAIN", title: "Main Menu" }
-      ]
-    );
-  }
-
-  async function notificationReply(result, fallbackBody) {
-    return {
-      body: fallbackBody,
-      notificationQueued: result?.status === "queued",
-      notificationFailureCode: result?.failureCode
-    };
-  }
-
-  return async function handle({ phoneE164, text = "", language = "en", replyId = "", messageId }) {
+  return async function handle({ phoneE164, text = "", language: requestedLanguage = "en", replyId = "", messageId = "", source = "text" }) {
     const phone = normalizePhone(phoneE164) || phoneE164;
     let session = await d.models.ConversationSession.findOne({ phoneE164: phone });
-    if (!session) {
-      session = await d.models.ConversationSession.create({
-        phoneE164: phone, language: language || "en", state: "MAIN_MENU", lastMessageAt: new Date()
-      });
-    }
-
+    if (!session) session = await d.models.ConversationSession.create({ phoneE164: phone, language: requestedLanguage === "ur" ? "ur" : "en", state: "IDLE", context: {}, lastMessageAt: new Date() });
+    if (session.aiPaused) return reply.text("The clinic receptionist is assisting you. Automated replies will resume when staff returns the conversation.");
     const input = String(text || "").trim();
     const action = String(replyId || input).trim();
-    const upperAction = action.toUpperCase();
-    const lang = session.language || "en";
+    const upper = action.toUpperCase();
+    const facts = await d.understand(input || action, { context: session.context || {}, phone });
+    const lang = language(facts.language || session.context?.language || requestedLanguage);
+    session.lastAiIntent = facts.intent; session.lastAiConfidence = facts.confidence;
 
-    if (/^(HI|HELLO|HEY|MENU|START)$/i.test(input) || upperAction === "MENU_MAIN") {
-      session.aiPaused = false;
-      session.humanRequired = false;
-      await save(session, "MAIN_MENU", {});
-      return msg.mainMenu(lang);
-    }
-    if (upperAction === "LANG_EN" || upperAction === "LANG_UR") {
-      session.language = upperAction === "LANG_UR" ? "ur" : "en";
-      await save(session, "MAIN_MENU", {});
-      return msg.mainMenu(session.language);
-    }
-    if (upperAction === "BACK") {
-      await save(session, "MAIN_MENU", {});
-      return msg.mainMenu(lang);
-    }
-    if (session.aiPaused) return { body: "You are currently connected with Dr. Sohaib's clinic staff. Type MENU to return to the automated assistant." };
-
-    if (/\b(emergency|urgent|accident|severe pain|bleeding|injury)\b/i.test(input)) {
-      await d.models.EmergencyAlert.create({
-        phoneE164: phone, patient: session.patient || null, conversation: session._id,
-        alertMessage: input, priority: "critical", status: "open"
-      });
-      const hotline = require("../config/env").config.clinicContactNumber;
-      return { body: `${tr(lang, "emergency")}${hotline ? `\n\nClinic Hotline: ${hotline}` : ""}` };
-    }
-
-    if (upperAction === "MENU_BOOK" || (session.state === "MAIN_MENU" && /^(1|book|book appointment)$/i.test(input))) return locationMenu(session, "booking");
-    if (upperAction === "MENU_MANAGE" || (session.state === "MAIN_MENU" && /^(2|manage|manage appointment)$/i.test(input))) return manageAppointment(session, phone);
-    if (upperAction === "MANAGE_LOOKUP" || /^lookup$/i.test(input)) {
-      await save(session, "LOOKUP_ID", {});
-      return { body: "Enter your appointment ID. It will be verified against this WhatsApp number." };
-    }
-    if (upperAction === "MENU_CLINIC" || (session.state === "MAIN_MENU" && /^(3|clinic|location)$/i.test(input))) {
-      const locations = await d.locationService.listLocations();
-      return { body: `Clinic locations:\n\n${locations.map((location) => `${location.city}: ${location.clinicName} — ${location.status}`).join("\n")}` };
-    }
-    if (upperAction === "MENU_PROFILE" || upperAction === "MENU_TREATMENTS" || (session.state === "MAIN_MENU" && /^(4|doctor|profile)$/i.test(input))) {
-      return { body: "Dr. Sohaib is a specialist physician and surgeon. Consultation schedules depend on the selected active clinic." };
-    }
-    if (upperAction === "MENU_STAFF" || (session.state === "MAIN_MENU" && /^(6|staff|human)$/i.test(input))) {
-      session.humanRequired = true;
-      session.aiPaused = true;
-      await save(session, "STAFF_HANDOVER", {});
-      return { body: tr(lang, "staff") };
-    }
-
-    if (upperAction.startsWith("BOOK_LOCATION_") || session.state === "BOOKING_LOCATION") {
-      const locationId = upperAction.startsWith("BOOK_LOCATION_") ? action.slice("BOOK_LOCATION_".length) : input;
-      try {
-        const location = await d.locationService.getBookableLocation(locationId);
-        await save(session, "BOOKING_DATE", { locationId: location.code, locationName: `${location.clinicName}, ${location.city}` });
-        return dateMenu(session, "booking");
-      } catch {
-        return { body: "That clinic selection is invalid or is no longer accepting bookings. Type BACK or select an active clinic." };
+    if (emergencyPattern.test(input) || facts.intent === "emergency") {
+      await save(session, "EMERGENCY_STOP", { language: lang });
+      if (d.models.EmergencyAlert) {
+        await d.models.EmergencyAlert.create({
+          phoneE164: phone,
+          conversation: session._id,
+          alertMessage: "Emergency language detected; automated clinical conversation stopped.",
+          priority: "critical",
+          status: "open"
+        });
       }
+      return reply.text(config.aiConcierge.emergencyMessage);
     }
+    if (unsafeMedicalPattern.test(input)) return handoff(session, phone, "Medical advice or report interpretation request");
+    const greetingOnly = /^(hi|hello|hey|salam|assalam(?:-o-alaikum)?|aoa|start)[!.\s]*$/i.test(input);
+    if (greetingOnly || (facts.intent === "greeting" && input.split(/\s+/).length <= 3)) {
+      await save(session, "IDLE", { language: lang });
+      return reply.text("Assalam-o-Alaikum! I’m Dr. Sohaib’s Smart Clinic Assistant.\nYou can type or send a voice note and tell me how I can help.");
+    }
+    if (facts.intent === "staff_handoff") return handoff(session, phone, "Patient requested a person");
+    if (facts.intent === "clinic_info" || upper === "AI_DIRECTIONS") return clinicInformation();
+    if (upper === "AI_TALK_RECEPTION") return handoff(session, phone, "Patient requested reception after booking");
+    if (upper === "AI_REPORTS_ADD" && session.state === "AWAITING_REPORT") return reply.text("Please attach the next PDF, JPEG, or PNG report.");
+    if (upper === "AI_REPORTS_DONE" && session.state === "AWAITING_REPORT") { await save(session, "IDLE", { language: lang, appointmentId: session.context.appointmentId }); return reply.text("Thank you. Your reports are securely linked to the appointment."); }
 
-    if (upperAction.startsWith("BOOK_DATES_MORE_") && session.state === "BOOKING_DATE") {
-      return dateMenu(session, "booking", Number(upperAction.split("_").pop()) || 0);
+    if (upper.startsWith("AI_CLINIC_") && session.state === "BOOKING_CLINIC") {
+      const locations = await d.tools.get_clinic_information({});
+      const selected = locations.find((item) => item.code === action.slice("AI_CLINIC_".length));
+      if (!selected) return reply.text("That clinic is unavailable. Please tell me which clinic you prefer.");
+      return continueBooking(session, phone, { ...session.context, locationId: String(selected._id || selected.code), locationName: `${selected.clinicName}, ${selected.city}` }, messageId);
     }
-    if (upperAction.startsWith("BOOK_DATE_") || session.state === "BOOKING_DATE") {
-      const date = upperAction.startsWith("BOOK_DATE_") ? action.slice("BOOK_DATE_".length) : input;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { body: "That date selection is invalid. Select a displayed date or type BACK." };
-      const dates = await d.availabilityService.getAvailableDates(session.context.locationId, 60);
-      if (!dates.some((entry) => entry.date === date)) return { body: "That date is closed, blocked, expired, or no longer available. Select another displayed date." };
-      await save(session, "BOOKING_TIME", { ...session.context, date });
-      return slotMenu(session, "booking");
+    if (upper.startsWith("AI_TIME_") && session.state === "BOOKING_TIME") {
+      const time = action.slice("AI_TIME_".length);
+      if (!(session.context.availableTimes || []).includes(time)) return reply.text("Please choose one of the displayed times.");
+      const context = { ...session.context, time }; delete context.availableTimes;
+      return askReports(session, context);
     }
-
-    if (upperAction.startsWith("BOOK_SLOTS_MORE_") && session.state === "BOOKING_TIME") {
-      return slotMenu(session, "booking", Number(upperAction.split("_").pop()) || 0);
+    if (["AI_REPORTS_YES", "AI_REPORTS_NO"].includes(upper) && session.state === "BOOKING_REPORTS") {
+      const context = { ...session.context, wantsReports: upper === "AI_REPORTS_YES", summarySource: source === "voice" ? "whatsapp_voice" : "whatsapp_text" };
+      await save(session, "BOOKING_SUMMARY", context);
+      return reply.buttons(`${visitSummary(context)}\n\nIs everything correct?`, [{ id: "AI_SUMMARY_OK", title: "Everything Is Correct" }, { id: "AI_SUMMARY_CHANGE", title: "Make a Change" }]);
     }
-    if (upperAction.startsWith("BOOK_SLOT_") || session.state === "BOOKING_TIME") {
-      const time = upperAction.startsWith("BOOK_SLOT_") ? action.slice("BOOK_SLOT_".length) : input;
-      const slots = await d.availabilityService.getAvailableSlots(session.context.locationId, session.context.date);
-      if (!slots.some((slot) => slot.time === time && slot.available)) return { body: "That time is invalid, blocked, expired, or was just booked. Select another displayed time." };
-      await save(session, "BOOKING_NAME", { ...session.context, time });
-      return { body: tr(lang, "name") };
+    if (upper === "AI_SUMMARY_CHANGE" && session.state === "BOOKING_SUMMARY") { await save(session, "BOOKING_CHANGE", session.context); return reply.text("Tell me the detail you would like to change."); }
+    if (upper === "AI_SUMMARY_OK" && session.state === "BOOKING_SUMMARY") {
+      await save(session, "BOOKING_CONSENT", { ...session.context, summaryApprovedAt: new Date().toISOString() });
+      return reply.buttons(`${config.appointmentConsent.text}\n\nDo you consent?`, [{ id: "AI_CONSENT_YES", title: "Yes, I Consent" }, { id: "AI_CONSENT_NO", title: "No" }]);
     }
-
-    if (session.state === "BOOKING_NAME") {
-      if (input.length < 2 || input.length > 160) return { body: tr(lang, "invalidName") };
-      await save(session, "BOOKING_REASON", { ...session.context, fullName: input });
-      return msg.list(tr(lang, "reason"), consultationReasons.map((reason, index) => ({
-        id: `BOOK_REASON_${index}`, title: reason.slice(0, 24)
-      })), "Select reason");
+    if (upper === "AI_CONSENT_NO" && session.state === "BOOKING_CONSENT") { await save(session, "IDLE", { language: lang }); return reply.text("No appointment was created because consent was not provided."); }
+    if (upper === "AI_CONSENT_YES" && session.state === "BOOKING_CONSENT") {
+      await save(session, "BOOKING_CONFIRM", { ...session.context, consentGiven: true });
+      return reply.buttons(`Please confirm ${session.context.fullName} on ${session.context.date} at ${session.context.time}, ${session.context.locationName}.`, [{ id: "AI_BOOK_CONFIRM", title: "Confirm Appointment" }, { id: "AI_BOOK_TIME", title: "Change Time" }]);
     }
-
-    if (upperAction.startsWith("BOOK_REASON_") || session.state === "BOOKING_REASON") {
-      let reason = input;
-      if (upperAction.startsWith("BOOK_REASON_")) reason = consultationReasons[Number(action.slice("BOOK_REASON_".length))];
-      else if (/^\d+$/.test(input) && consultationReasons[Number(input) - 1]) reason = consultationReasons[Number(input) - 1];
-      if (!reason || reason.length > 1000) return { body: "Select a displayed reason or type a short consultation reason." };
-      await save(session, "BOOKING_CONSENT", { ...session.context, reason });
-      return msg.buttons(
-        `${require("../config/env").config.appointmentConsent.text} Do you consent?`,
-        [{ id: "BOOK_CONSENT_YES", title: "Yes, I consent" }, { id: "BOOK_CONSENT_NO", title: "No" }, { id: "MENU_MAIN", title: "Main Menu" }]
-      );
+    if (upper === "AI_BOOK_TIME" && session.state === "BOOKING_CONFIRM") { const context = { ...session.context }; delete context.time; delete context.preferredTime; return continueBooking(session, phone, context, messageId); }
+    if (upper === "AI_BOOK_CONFIRM" && session.state === "BOOKING_CONFIRM") {
+      const context = session.context;
+      try {
+        const appointment = await d.tools.create_appointment({ confirmed: true, fullName: context.fullName, phone, ...(Number.isInteger(context.age) ? { age: context.age } : {}), patientFor: context.patientFor || "unknown", reason: context.reason, locationId: context.locationId, date: context.date, time: context.time, consentGiven: true, preferredLanguage: lang === "ur" ? "ur" : "en", idempotencyKey: messageId || `wa:${phone}:${context.date}:${context.time}` });
+        appointment.patientProvidedVisitSummary = { patientName: context.fullName, ...(Number.isInteger(context.age) ? { age: context.age } : {}), concern: context.reason, reportsAttached: 0, disclaimer: "Patient-provided information only — not an AI diagnosis.", approvedAt: new Date(context.summaryApprovedAt), source: context.summarySource || "whatsapp_text" };
+        await appointment.save();
+        if (config.aiConcierge.doctorWelcomeMediaId && d.models.Appointment?.countDocuments) {
+          const patientAppointments = await d.models.Appointment.countDocuments({ patient: appointment.patient });
+          if (patientAppointments === 1) {
+            const mediaType = config.aiConcierge.doctorWelcomeMediaId.startsWith("video:") ? "video" : "audio";
+            const mediaId = config.aiConcierge.doctorWelcomeMediaId.replace(/^(?:audio|video):/, "");
+            const sent = await d.sendMedia(phone, mediaType, mediaId, "Welcome from Dr. Sohaib").catch(() => null);
+            if (["accepted", "queued", "sent"].includes(sent?.status)) { appointment.doctorWelcomeSentAt = new Date(); await appointment.save(); }
+          }
+        }
+        await save(session, context.wantsReports ? "AWAITING_REPORT" : "IDLE", { language: lang, appointmentId: appointment.appointmentId, wantsReports: context.wantsReports });
+        return reply.buttons(`✅ Appointment Confirmed\n${context.fullName}\n${context.date}, ${context.time}\nToken: ${appointment.tokenNumber}\n${context.locationName}\nReports received: 0${context.wantsReports ? "\n\nPlease attach the report now as a PDF, JPEG, or PNG." : ""}`, [{ id: "AI_DIRECTIONS", title: "Directions" }, { id: "AI_CHANGE_APPOINTMENT", title: "Change Appointment" }, { id: "AI_TALK_RECEPTION", title: "Talk to Reception" }]);
+      } catch (error) { return reply.text(error?.statusCode ? `${error.message} Please choose another time.` : "I couldn’t complete the appointment safely. Please talk to reception."); }
     }
 
     if (session.state === "BOOKING_CONSENT") {
-      if (upperAction === "BOOK_CONSENT_NO" || /^(no|decline)$/i.test(input)) {
-        await d.appointmentService.recordConsentDecision({
-          fullName: session.context.fullName,
-          phone,
-          consentGiven: false,
-          consentTextVersion: require("../config/env").config.appointmentConsent.version,
-          preferredLanguage: lang
-        }, "whatsapp").catch((error) => logError("Consent decision could not be recorded", error));
-        await save(session, "MAIN_MENU", {});
-        return { body: "No appointment was created because consent was not provided. Type MENU to continue." };
-      }
-      if (upperAction !== "BOOK_CONSENT_YES" && !/^(yes|i consent|consent|agree)$/i.test(input)) {
-        return { body: "Consent is required. Select Yes, No, or Main Menu." };
-      }
-      await save(session, "BOOKING_REVIEW", { ...session.context, consentGiven: true });
-      return bookingReview(session);
-    }
-
-    if (upperAction === "CONFIRM_BOOKING" && session.state === "BOOKING_REVIEW") {
-      try {
-        const appointment = await d.appointmentService.createAppointment({
-          fullName: session.context.fullName,
-          phone,
-          reason: session.context.reason,
-          date: session.context.date,
-          time: session.context.time,
-          locationId: session.context.locationId,
-          consentGiven: session.context.consentGiven === true,
-          consentTextVersion: require("../config/env").config.appointmentConsent.version,
-          preferredLanguage: lang
-        }, { source: "whatsapp", idempotencyKey: messageId, skipNotification: true });
-        const notification = await d.appointmentNotificationService.sendAppointmentConfirmation(appointment);
-        await save(session, "MAIN_MENU", {});
-        return notificationReply(notification, `Appointment confirmed.\n\n${appointmentSummary(appointment)}\n\nType MENU for more options.`);
-      } catch (error) {
-        return { body: error?.statusCode ? `${error.message} Select another slot or type MENU.` : "The appointment could not be completed. Please select another slot or contact clinic staff." };
-      }
-    }
-
-    if (session.state === "LOOKUP_ID") {
-      try {
-        const appointment = await d.appointmentService.lookupAppointment({ appointmentId: input, phone });
-        return manageAppointment(session, phone, appointment);
-      } catch {
-        return { body: "No appointment matched that ID and this WhatsApp number. Check the ID or type MENU." };
-      }
-    }
-
-    if (upperAction.startsWith("MANAGE_CANCEL_") || (/^cancel$/i.test(input) && session.context?.appointmentId)) {
-      const appointmentId = upperAction.startsWith("MANAGE_CANCEL_") ? action.slice("MANAGE_CANCEL_".length) : session.context.appointmentId;
-      await save(session, "CANCEL_CONFIRM", { appointmentId });
-      return msg.buttons(`Cancel appointment ${appointmentId}?`, [
-        { id: "CONFIRM_CANCEL", title: "Yes, cancel" }, { id: "BACK", title: "Back" }, { id: "MENU_MAIN", title: "Main Menu" }
+      return reply.buttons("Your active consent is required before an appointment can be created.", [
+        { id: "AI_CONSENT_YES", title: "Yes, I Consent" }, { id: "AI_CONSENT_NO", title: "No" }
       ]);
     }
-    if (upperAction === "CONFIRM_CANCEL" && session.state === "CANCEL_CONFIRM") {
-      try {
-        const appointment = await d.appointmentService.cancelAppointment(
-          { appointmentId: session.context.appointmentId, phone, reason: "Cancelled through WhatsApp" },
-          { source: "whatsapp", skipNotification: true }
-        );
-        const notification = await d.appointmentNotificationService.sendCancellationConfirmation(appointment);
-        await save(session, "MAIN_MENU", {});
-        return notificationReply(notification, `Appointment ${appointment.appointmentId} has been cancelled. Type MENU for more options.`);
-      } catch {
-        return { body: "The appointment could not be cancelled. Verify it is still eligible or contact clinic staff." };
-      }
+    if (session.state === "BOOKING_CONFIRM") {
+      return reply.buttons("Please explicitly confirm the appointment or choose another time.", [
+        { id: "AI_BOOK_CONFIRM", title: "Confirm Appointment" }, { id: "AI_BOOK_TIME", title: "Change Time" }
+      ]);
     }
 
-    if (upperAction.startsWith("MANAGE_RESCHEDULE_") || (/^reschedule$/i.test(input) && session.context?.appointmentId)) {
-      const appointmentId = upperAction.startsWith("MANAGE_RESCHEDULE_") ? action.slice("MANAGE_RESCHEDULE_".length) : session.context.appointmentId;
-      await save(session, "RESCHEDULE_LOCATION", { appointmentId });
-      return locationMenu(session, "reschedule");
+    if (upper === "AI_CHANGE_APPOINTMENT") { await save(session, "RESCHEDULE_ID", { language: lang }); return reply.text("Please send the appointment ID from your confirmation."); }
+    if (upper === "AI_CANCEL_KEEP" && session.state === "CANCEL_CONFIRM") { await save(session, "IDLE", { language: lang }); return reply.text("Your appointment was kept unchanged."); }
+    if (upper === "AI_CANCEL_CONFIRM" && session.state === "CANCEL_CONFIRM") {
+      const appointment = await d.tools.cancel_appointment({ confirmed: true, appointmentId: session.context.appointmentId, phone });
+      await save(session, "IDLE", { language: lang }); return reply.text(`Appointment ${appointment.appointmentId} has been cancelled.`);
+    }
+    if (facts.intent === "cancel" || session.state === "CANCEL_ID") {
+      const appointmentId = facts.appointmentId || (session.state === "CANCEL_ID" ? input.toUpperCase() : null);
+      if (!appointmentId) { await save(session, "CANCEL_ID", { language: lang }); return reply.text("Please send the appointment ID you want to cancel."); }
+      try { await d.tools.lookup_verified_appointment({ appointmentId, phone }); }
+      catch { return reply.text("I couldn’t verify that appointment with this WhatsApp number. Please check the ID or talk to reception."); }
+      await save(session, "CANCEL_CONFIRM", { language: lang, appointmentId });
+      return reply.buttons(`Cancel appointment ${appointmentId}?`, [{ id: "AI_CANCEL_CONFIRM", title: "Confirm Cancellation" }, { id: "AI_CANCEL_KEEP", title: "Keep Appointment" }]);
     }
 
-    if (upperAction.startsWith("RESCHEDULE_LOCATION_") || session.state === "RESCHEDULE_LOCATION") {
-      const locationId = upperAction.startsWith("RESCHEDULE_LOCATION_") ? action.slice("RESCHEDULE_LOCATION_".length) : input;
-      try {
-        const location = await d.locationService.getBookableLocation(locationId);
-        await save(session, "RESCHEDULE_DATE", { ...session.context, locationId: location.code, locationName: `${location.clinicName}, ${location.city}` });
-        return dateMenu(session, "reschedule");
-      } catch {
-        return { body: "That clinic selection is invalid or unavailable. Type BACK or select an active clinic." };
+    if (upper.startsWith("AI_RESCHEDULE_TIME_") && session.state === "RESCHEDULE_TIME") {
+      const time = action.slice("AI_RESCHEDULE_TIME_".length);
+      if (!(session.context.availableTimes || []).includes(time)) return reply.text("Please choose one of the offered times.");
+      const context = { ...session.context, time }; delete context.availableTimes; await save(session, "RESCHEDULE_CONFIRM", context);
+      return reply.buttons(`Move ${context.appointmentId} to ${context.date} at ${time}?`, [{ id: "AI_RESCHEDULE_CONFIRM", title: "Confirm Change" }, { id: "AI_RESCHEDULE_STOP", title: "Keep Current" }]);
+    }
+    if (upper === "AI_RESCHEDULE_STOP" && session.state === "RESCHEDULE_CONFIRM") { await save(session, "IDLE", { language: lang }); return reply.text("Your current appointment was kept unchanged."); }
+    if (upper === "AI_RESCHEDULE_CONFIRM" && session.state === "RESCHEDULE_CONFIRM") {
+      const context = session.context;
+      const appointment = await d.tools.reschedule_appointment({ confirmed: true, appointmentId: context.appointmentId, phone, locationId: context.locationId, date: context.date, time: context.time });
+      await save(session, "IDLE", { language: lang }); return reply.text(`Appointment ${appointment.appointmentId} is now scheduled for ${appointment.date} at ${appointment.time}.`);
+    }
+    if (facts.intent === "reschedule" || session.state.startsWith("RESCHEDULE_")) {
+      let context = mergeFacts(session.context || {}, facts);
+      if (session.state === "RESCHEDULE_ID" && !context.appointmentId) context.appointmentId = input.toUpperCase();
+      if (!context.appointmentId) { await save(session, "RESCHEDULE_ID", context); return reply.text("Please send the appointment ID you want to change."); }
+      try { await d.tools.lookup_verified_appointment({ appointmentId: context.appointmentId, phone }); }
+      catch { return reply.text("I couldn’t verify that appointment with this WhatsApp number. Please check the ID or talk to reception."); }
+      context.date = resolveDate(context.preferredDate || context.date);
+      if (!context.date) { await save(session, "RESCHEDULE_DATE", context); return reply.text("Which new day would you prefer?"); }
+      const location = await findActiveClinic();
+      if (!location) return handoff(session, phone, "No clinic available for rescheduling");
+      context.locationId = String(location._id || location.code); context.locationName = `${location.clinicName}, ${location.city}`;
+      const slots = await d.tools.get_available_slots({ locationId: context.locationId, date: context.date });
+      const wanted = normalizeTime(context.preferredTime || context.time);
+      if (!wanted || !slots.some((slot) => slot.time === wanted)) {
+        await save(session, "RESCHEDULE_TIME", { ...context, availableTimes: slots.slice(0, 3).map((slot) => slot.time) });
+        if (!slots.length) return reply.text("No time is available on that day. Which other day would suit you?");
+        return reply.buttons("Which new time suits you?", slots.slice(0, 3).map((slot) => ({ id: `AI_RESCHEDULE_TIME_${slot.time}`, title: slot.time })));
       }
-    }
-    if (upperAction.startsWith("RESCHEDULE_DATES_MORE_") && session.state === "RESCHEDULE_DATE") {
-      return dateMenu(session, "reschedule", Number(upperAction.split("_").pop()) || 0);
-    }
-    if (upperAction.startsWith("RESCHEDULE_DATE_") || session.state === "RESCHEDULE_DATE") {
-      const date = upperAction.startsWith("RESCHEDULE_DATE_") ? action.slice("RESCHEDULE_DATE_".length) : input;
-      const dates = await d.availabilityService.getAvailableDates(session.context.locationId, 60);
-      if (!dates.some((entry) => entry.date === date)) return { body: "That date is closed, blocked, expired, or unavailable. Select another date." };
-      await save(session, "RESCHEDULE_TIME", { ...session.context, date });
-      return slotMenu(session, "reschedule");
-    }
-    if (upperAction.startsWith("RESCHEDULE_SLOTS_MORE_") && session.state === "RESCHEDULE_TIME") {
-      return slotMenu(session, "reschedule", Number(upperAction.split("_").pop()) || 0);
-    }
-    if (upperAction.startsWith("RESCHEDULE_SLOT_") || session.state === "RESCHEDULE_TIME") {
-      const time = upperAction.startsWith("RESCHEDULE_SLOT_") ? action.slice("RESCHEDULE_SLOT_".length) : input;
-      const slots = await d.availabilityService.getAvailableSlots(session.context.locationId, session.context.date);
-      if (!slots.some((slot) => slot.time === time && slot.available)) return { body: "That time is invalid, blocked, expired, or occupied. Select another time." };
-      await save(session, "RESCHEDULE_REVIEW", { ...session.context, time });
-      return rescheduleReview(session);
-    }
-    if (upperAction === "CONFIRM_RESCHEDULE" && session.state === "RESCHEDULE_REVIEW") {
-      try {
-        const appointment = await d.appointmentService.rescheduleAppointment({
-          appointmentId: session.context.appointmentId,
-          phone,
-          locationId: session.context.locationId,
-          date: session.context.date,
-          time: session.context.time,
-          reason: "Rescheduled through WhatsApp"
-        }, { skipNotification: true });
-        const notification = await d.appointmentNotificationService.sendRescheduleConfirmation(appointment);
-        await save(session, "MAIN_MENU", {});
-        return notificationReply(notification, `Appointment rescheduled.\n\n${appointmentSummary(appointment)}\n\nType MENU for more options.`);
-      } catch {
-        return { body: "The appointment could not be rescheduled. The slot may have been taken; select another slot or contact clinic staff." };
-      }
+      context.time = wanted; await save(session, "RESCHEDULE_CONFIRM", context);
+      return reply.buttons(`Move ${context.appointmentId} to ${context.date} at ${context.time}?`, [{ id: "AI_RESCHEDULE_CONFIRM", title: "Confirm Change" }, { id: "AI_RESCHEDULE_STOP", title: "Keep Current" }]);
     }
 
-    await save(session, "MAIN_MENU", {});
-    return { ...msg.mainMenu(lang), body: `That selection was invalid or expired.\n\n${tr(lang, "welcome")}` };
+    if (session.state === "STATUS_ID" || facts.intent === "visit_status" || facts.intent === "lookup") {
+      const appointmentId = facts.appointmentId || (session.state === "STATUS_ID" ? input.toUpperCase() : null);
+      if (!appointmentId) { await save(session, "STATUS_ID", { language: lang }); return reply.text("Please send your appointment ID so I can verify it."); }
+      try { const status = await d.tools.get_visit_status({ appointmentId, phone }); await save(session, "IDLE", { language: lang }); return reply.text(`Appointment ${status.appointmentId}\n${status.date}, ${status.time}\nToken: ${status.tokenNumber}\nStatus: ${status.status}`); }
+      catch { return reply.text("I couldn’t verify that appointment with this WhatsApp number."); }
+    }
+
+    const bookingState = session.state.startsWith("BOOKING_");
+    if (facts.intent === "book" || bookingState) {
+      let context = mergeFacts(session.context || { language: lang }, facts);
+      if (session.state === "BOOKING_CHANGE") {
+        const changedDate = resolveDate(facts.preferredDate || "");
+        if (changedDate) { context.date = changedDate; context.preferredDate = changedDate; delete context.time; delete context.preferredTime; }
+        if (facts.preferredTime) { context.preferredTime = facts.preferredTime; delete context.time; }
+        if (facts.patientName) context.fullName = facts.patientName;
+        if (Number.isInteger(facts.age)) context.age = facts.age;
+        if (facts.concern) context.reason = facts.concern;
+        if (!facts.patientName && !Number.isInteger(facts.age) && !facts.concern && !changedDate && !facts.preferredTime) {
+          const name = input.match(/(?:name\s+(?:is|should be)|naam\s+)([\p{L}][\p{L} .'-]{1,80})/iu);
+          const age = input.match(/(?:age|umar)\s*(?:is|hai|=|:)?\s*(\d{1,3})/i);
+          if (name) context.fullName = name[1].trim();
+          if (age && Number(age[1]) <= 130) context.age = Number(age[1]);
+        }
+      }
+      if (session.state === "BOOKING_NAME" && !context.fullName && input.length >= 2) context.fullName = input.slice(0, 160);
+      if (session.state === "BOOKING_CONCERN" && !context.reason && input.length >= 2) context.reason = input.slice(0, 500);
+      if (session.state === "BOOKING_DATE" && !context.preferredDate) context.preferredDate = input;
+      return continueBooking(session, phone, context, messageId);
+    }
+    if (facts.confidence < 0.45) return handoff(session, phone, "Low-confidence patient request");
+    return reply.text("Please tell me in one message if you need an appointment, want to change or cancel one, need the clinic location, or want reception staff.");
   };
 }
 
-module.exports = { createConversationOrchestrator, handleIncomingMessage: createConversationOrchestrator() };
+module.exports = { createConversationOrchestrator, handleIncomingMessage: createConversationOrchestrator(), resolveDate, mergeFacts, visitSummary };

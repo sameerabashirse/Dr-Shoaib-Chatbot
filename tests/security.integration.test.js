@@ -338,20 +338,19 @@ test("authorized clinical, reception and operational mutations follow the matrix
   const staffMessage = await request(`/api/conversations/${conversationId}/messages`, { method: "POST", token: tokens.clinic_staff, body: { body: "Clinic response" } });
   assert.equal(staffMessage.response.status, 201);
 
-  const consentPrompt = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "1", language: "en" } });
-  assert.match(consentPrompt.data.reply.body, /active clinic/i);
-  const clinicSelected = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "BWP", language: "en" } });
-  const bookingDateId = clinicSelected.data.reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_DATE_")).id;
-  const dateSelected = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: bookingDateId, language: "en" } });
-  const bookingSlotId = dateSelected.data.reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_SLOT_")).id;
-  await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: bookingSlotId, language: "en" } });
+  const bookingStarted = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "I need an appointment Monday", language: "en" } });
+  assert.match(bookingStarted.data.reply.body, /full name/i);
   await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "Consent Test Patient", language: "en" } });
-  const consentQuestion = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "BOOK_REASON_0", language: "en" } });
+  const timeQuestion = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "Knee pain follow-up", language: "en" } });
+  const timeId = timeQuestion.data.reply.buttons.find((button) => button.id.startsWith("AI_TIME_")).id;
+  await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: timeId, language: "en" } });
+  await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "AI_REPORTS_NO", language: "en" } });
+  const consentQuestion = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "AI_SUMMARY_OK", language: "en" } });
   assert.match(consentQuestion.data.reply.body, /consent/i);
   const beforeConsent = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "Patient Name", language: "en" } });
   assert.match(beforeConsent.data.reply.body, /consent is required/i);
-  const consented = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "YES", language: "en" } });
-  assert.match(consented.data.reply.body, /review your appointment/i);
+  const consented = await request("/api/whatsapp/simulate-message", { method: "POST", token: tokens.receptionist, body: { phone: "03005556666", message: "AI_CONSENT_YES", language: "en" } });
+  assert.match(consented.data.reply.body, /confirm/i);
 });
 
 test("security audit records preserve actor role, request ID, IP and user agent without content", async () => {

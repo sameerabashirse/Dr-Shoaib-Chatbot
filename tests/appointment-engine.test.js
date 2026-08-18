@@ -236,6 +236,20 @@ test("website and WhatsApp retries are idempotent and different payload reuse is
   assert.equal(await Appointment.countDocuments(), 2);
 });
 
+test("verified returning contacts retain separate self and family profiles", async () => {
+  await createAppointment(booking({
+    fullName: "Ahmed Synthetic", patientFor: "self", phone: "03000000991"
+  }), { source: "whatsapp", idempotencyKey: "profile-self", skipNotification: true });
+  await createAppointment(booking({
+    fullName: "Fatima Synthetic", age: 58, patientFor: "family", phone: "03000000991",
+    date: futureOpenDate(0, 2)
+  }), { source: "whatsapp", idempotencyKey: "profile-family", skipNotification: true });
+  const patient = await Patient.findOne({ phoneE164: "+923000000991" });
+  assert.equal(patient.fullName, "Ahmed Synthetic");
+  assert.equal(patient.knownProfiles.length, 2);
+  assert.equal(patient.knownProfiles.find((profile) => profile.relationship === "family").fullName, "Fatima Synthetic");
+});
+
 test("all booking sources share blocked-slot rules and the unique indexes exist", async () => {
   const date = futureOpenDate();
   await blockSlot({ locationId: "BWP", date, time: "18:00", reason: "Blocked" });

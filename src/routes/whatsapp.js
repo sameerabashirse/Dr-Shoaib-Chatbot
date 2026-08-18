@@ -14,6 +14,8 @@ const {
   sendStaffMessage
 } = require("../services/whatsappService");
 const { handleIncomingMessage } = require("../conversation/orchestrator");
+const { transcribeWhatsAppVoiceNote } = require("../services/voiceTranscriptionService");
+const { storeWhatsAppReport } = require("../services/whatsappReportService");
 const { ConversationSession, WhatsAppMessage, Patient } = require("../models");
 const { requireAuth } = require("../middleware/auth");
 const { requirePermission } = require("../middleware/permissions");
@@ -61,9 +63,36 @@ router.post("/webhook", webhookLimiter, asyncHandler(async (req, res) => {
         payload: message.payload
       });
       if (logged.duplicate) return;
-      if (message.body) {
-        await markMessageAsRead(message.metaMessageId).catch(() => undefined);
-        const reply = await handleIncomingMessage({ phoneE164: message.phoneE164, text: message.body, replyId: message.replyId, messageId: message.metaMessageId });
+      await markMessageAsRead(message.metaMessageId).catch(() => undefined);
+      if (["document", "image"].includes(message.type) && message.mediaId) {
+        const session = await ConversationSession.findOne({ phoneE164: message.phoneE164 });
+        if (session?.state !== "AWAITING_REPORT" || !session.context?.appointmentId) {
+          await sendText(message.phoneE164, "Please confirm an appointment first, then choose Upload Reports before attaching a PDF, JPEG, or PNG.");
+          return;
+        }
+        try {
+          const result = await storeWhatsAppReport({ phone: message.phoneE164, appointmentId: session.context.appointmentId, mediaId: message.mediaId, filename: message.filename });
+          await sendReplyButtons(message.phoneE164, `Report received securely. Total reports attached: ${result.reportCount}.`, [
+            { id: "AI_REPORTS_ADD", title: "Add Another" }, { id: "AI_REPORTS_DONE", title: "Done" }
+          ]);
+        } catch {
+          await sendText(message.phoneE164, "I couldn’t store that document securely. Please send a valid PDF, JPEG, or PNG within the size limit, or contact reception.");
+        }
+        return;
+      }
+      let patientText = message.body;
+      let source = "text";
+      if (message.type === "audio" && message.mediaId) {
+        const transcription = await transcribeWhatsAppVoiceNote(message.mediaId);
+        if (!transcription.ok) {
+          await sendText(message.phoneE164, "I couldn’t understand that voice note clearly. Please send a shorter voice note or type your request.");
+          return;
+        }
+        patientText = transcription.text;
+        source = "voice";
+      }
+      if (patientText) {
+        const reply = await handleIncomingMessage({ phoneE164: message.phoneE164, text: patientText, replyId: message.replyId, messageId: message.metaMessageId, source });
         if (!reply?.notificationQueued) {
           if (reply?.kind === "buttons") await sendReplyButtons(message.phoneE164, reply.body, reply.buttons);
           else if (reply?.kind === "list") await sendInteractiveList(message.phoneE164, reply.body, reply.buttonText, reply.sections);

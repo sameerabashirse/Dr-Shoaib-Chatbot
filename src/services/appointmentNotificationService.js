@@ -83,9 +83,33 @@ async function sendAppointmentReminder(appointment) {
   );
 }
 
+async function sendArrivalUpdate(appointment, { arrivalTime, delayMinutes = 0 } = {}) {
+  const name = config.whatsapp.templates.arrivalUpdate;
+  if (templateUnavailable(name)) return { status: "skipped", failureCode: "TEMPLATE_NOT_CONFIGURED" };
+  const delayMessage = delayMinutes > 0
+    ? `Dr. Sohaib is approximately ${delayMinutes} minutes behind schedule.`
+    : "No clinic delay has been reported.";
+  return sendTemplate(
+    appointment.phoneE164,
+    name,
+    config.whatsapp.templates.arrivalUpdateLanguage,
+    [
+      appointment.patientSnapshot.fullName,
+      appointment.appointmentId,
+      appointment.time,
+      arrivalTime,
+      delayMessage,
+      appointment.locationSnapshot?.clinicName || "Dr. Sohaib Clinic",
+      appointment.locationSnapshot?.address || appointment.locationSnapshot?.city || "Clinic"
+    ],
+    { expectedParameterCount: 7 }
+  );
+}
+
 module.exports = {
   sendAppointmentConfirmation,
   sendRescheduleConfirmation,
   sendCancellationConfirmation,
-  sendAppointmentReminder
+  sendAppointmentReminder,
+  sendArrivalUpdate
 };

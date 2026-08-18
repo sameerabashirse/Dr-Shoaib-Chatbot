@@ -72,7 +72,7 @@ test("mobile patient completes the real website booking flow with active consent
   await expect(page.locator('[data-action="confirm_booking_final"]')).toBeVisible();
   await page.locator('[data-action="confirm_booking_final"]').click();
   await expect(page.locator("#chat-body")).toContainText("booked successfully", { timeout: 20_000 });
-  await expect(page.locator("#chat-body")).toContainText("Token Number");
+  await expect(page.locator("#chat-body")).toContainText(/Token:\s*\d+/);
   await expectNoPageOverflow(page, "completed mobile booking");
   await expectVisibleControlsContained(page, "completed mobile booking");
 });

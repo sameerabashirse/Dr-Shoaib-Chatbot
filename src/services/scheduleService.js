@@ -22,7 +22,7 @@ async function findConflictingAppointments(location, candidate) {
   });
 }
 
-async function updateLocation(locationId, input, { confirmExistingAppointments = false } = {}) {
+async function updateLocation(locationId, input, { confirmExistingAppointments = false, staffUser } = {}) {
   const location = await ClinicLocation.findById(locationId);
   if (!location) throw notFound("Clinic location was not found.");
   const update = { ...input };
@@ -45,6 +45,10 @@ async function updateLocation(locationId, input, { confirmExistingAppointments =
   }
 
   Object.assign(location, update);
+  if (Object.prototype.hasOwnProperty.call(update, "currentDelayMinutes")) {
+    location.delayUpdatedAt = new Date();
+    location.delayUpdatedBy = staffUser?._id;
+  }
   await location.save();
   return { location, conflictingAppointmentsPreserved: conflicts.length };
 }

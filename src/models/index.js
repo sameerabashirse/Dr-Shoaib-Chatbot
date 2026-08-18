@@ -57,7 +57,14 @@ const patientSchema = new Schema({
   city: { type: String, default: "Bahawalpur" },
   gender: { type: String, enum: ["female", "male", "other", "not_provided"], default: "not_provided" },
   notes: { type: String, maxlength: 1000 },
-  optOut: { type: Boolean, default: false }
+  optOut: { type: Boolean, default: false },
+  knownProfiles: [{
+    normalizedName: { type: String, required: true, maxlength: 160 },
+    fullName: { type: String, required: true, maxlength: 160 },
+    age: { type: Number, min: 0, max: 130 },
+    relationship: { type: String, enum: ["self", "family", "unknown"], default: "unknown" },
+    lastVerifiedAt: { type: Date, required: true, default: Date.now }
+  }]
 }, baseOptions);
 
 patientSchema.index({ fullName: "text", phoneE164: "text" });
@@ -138,6 +145,9 @@ const clinicLocationSchema = new Schema({
     default: [],
     validate: { validator: (entries) => new Set(entries.map((entry) => `${entry.date}|${entry.time}`)).size === entries.length, message: "Blocked slots must be unique" }
   },
+  currentDelayMinutes: { type: Number, min: 0, max: 480, default: 0 },
+  delayUpdatedAt: { type: Date },
+  delayUpdatedBy: { type: Schema.Types.ObjectId, ref: "StaffUser" },
   displayOrder: { type: Number, default: 0 }
 }, baseOptions);
 
@@ -224,6 +234,17 @@ const appointmentSchema = new Schema({
   cancelledBy: { type: Schema.Types.ObjectId, ref: "StaffUser" },
   completedAt: { type: Date },
   arrivedAt: { type: Date },
+  patientProvidedVisitSummary: {
+    patientName: { type: String, maxlength: 160 },
+    age: { type: Number, min: 0, max: 130 },
+    concern: { type: String, maxlength: 500 },
+    existingConditionShared: { type: String, maxlength: 500 },
+    reportsAttached: { type: Number, min: 0, default: 0 },
+    disclaimer: { type: String, maxlength: 300 },
+    approvedAt: { type: Date },
+    source: { type: String, enum: ["whatsapp_text", "whatsapp_voice"] }
+  },
+  doctorWelcomeSentAt: { type: Date },
   rescheduleHistory: [{
     previousLocation: { type: Schema.Types.ObjectId, ref: "ClinicLocation" },
     previousDate: String,
@@ -278,6 +299,9 @@ const conversationSessionSchema = new Schema({
   humanRequired: { type: Boolean, default: false },
   aiPaused: { type: Boolean, default: false },
   takenOverBy: { type: Schema.Types.ObjectId, ref: "StaffUser" },
+  handoffReason: { type: String, maxlength: 240 },
+  lastAiIntent: { type: String, maxlength: 60 },
+  lastAiConfidence: { type: Number, min: 0, max: 1 },
   lastMessageAt: { type: Date, default: Date.now },
   serviceWindowExpiresAt: { type: Date }
 }, baseOptions);
@@ -441,7 +465,7 @@ const reminderJobSchema = new Schema({
   appointment: { type: Schema.Types.ObjectId, ref: "Appointment", index: true },
   patient: { type: Schema.Types.ObjectId, ref: "Patient", index: true },
   phoneE164: { type: String, required: true, index: true },
-  type: { type: String, enum: ["appointment_reminder", "follow_up_reminder"], default: "appointment_reminder" },
+  type: { type: String, enum: ["appointment_reminder", "follow_up_reminder", "arrival_update"], default: "appointment_reminder" },
   dueAt: { type: Date, required: true, index: true },
   message: { type: String, required: true, maxlength: 2000 },
   status: { type: String, enum: REMINDER_DELIVERY_STATUSES, default: "pending" },

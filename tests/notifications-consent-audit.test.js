@@ -77,6 +77,7 @@ test.beforeEach(async () => {
   metaCalls = 0;
   metaPayloads = [];
   config.emailAppointmentAlert.enabled = false;
+  config.whatsapp.templates.arrivalUpdate = "";
   await Promise.all([
     Appointment.deleteMany({}), AuditLog.deleteMany({}), BookingRequest.deleteMany({}), Counter.deleteMany({}),
     EmailNotificationOutbox.deleteMany({}), Patient.deleteMany({}), PatientConsent.deleteMany({}),
@@ -92,6 +93,22 @@ test.beforeEach(async () => {
       headers: { "content-type": "application/json" }
     });
   });
+});
+
+test("arrival update uses only the administrator-entered clinic delay", async () => {
+  config.whatsapp.templates.arrivalUpdate = "arrival_update_v1";
+  config.whatsapp.templates.arrivalUpdateLanguage = "en_US";
+  await ClinicLocation.updateOne({ _id: bwp._id }, { $set: { currentDelayMinutes: 20, delayUpdatedAt: new Date() } });
+  const appointment = await book({}, "arrival-update");
+  const arrival = await ReminderJob.findOne({ appointment: appointment._id, type: "arrival_update" });
+  assert.ok(arrival);
+  arrival.dueAt = new Date(Date.now() - 1000);
+  await arrival.save();
+  const results = await processDueReminders({ limit: 1 });
+  assert.equal(results[0].status, "queued");
+  const parameters = metaPayloads[0].template.components[0].parameters.map((parameter) => parameter.text);
+  assert.ok(parameters.includes("Dr. Sohaib is approximately 20 minutes behind schedule."));
+  assert.ok(parameters.some((value) => /\d{2}:\d{2} [AP]M/.test(value)));
 });
 
 test("confirmed appointments create the configured jobs once and do not claim they were sent", async () => {

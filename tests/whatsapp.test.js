@@ -29,7 +29,8 @@ const { createAppointment } = require("../src/services/appointmentService");
 const { ensureInitialLocations } = require("../src/services/locationService");
 const {
   Appointment, AuditLog, BookingRequest, ClinicLocation, ConversationSession,
-  MessageDeliveryStatus, Patient, PatientConsent, ReminderJob, RescheduleHistory, WhatsAppMessage, Counter
+  MessageDeliveryStatus, Patient, PatientConsent, ReminderJob, RescheduleHistory, WhatsAppMessage, Counter,
+  EmergencyAlert
 } = require("../src/models");
 
 let mongod;
@@ -82,20 +83,22 @@ function incomingWebhook({ id, phone = "923001234567", text, replyId, replyTitle
 }
 
 async function reachBookingReview(phone = "+923001234567") {
-  await handleIncomingMessage({ phoneE164: phone, text: "Hi", messageId: "direct-hi" });
-  let reply = await handleIncomingMessage({ phoneE164: phone, text: "Book Appointment", replyId: "MENU_BOOK", messageId: "direct-book" });
-  const locationId = reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_LOCATION_")).id;
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Clinic", replyId: locationId, messageId: "direct-location" });
-  const dateId = reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_DATE_")).id;
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Date", replyId: dateId, messageId: "direct-date" });
-  const slotId = reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_SLOT_")).id;
-  await handleIncomingMessage({ phoneE164: phone, text: "Time", replyId: slotId, messageId: "direct-slot" });
-  await handleIncomingMessage({ phoneE164: phone, text: "WhatsApp Test Patient", messageId: "direct-name" });
-  await handleIncomingMessage({ phoneE164: phone, text: "General", replyId: "BOOK_REASON_0", messageId: "direct-reason" });
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Yes", replyId: "BOOK_CONSENT_YES", messageId: "direct-consent" });
-  assert.equal(reply.kind, "buttons");
+  let reply = await handleIncomingMessage({ phoneE164: phone, text: "I need an appointment on Monday", messageId: "direct-book" });
+  assert.match(reply.body, /full name/i);
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "WhatsApp Test Patient", messageId: "direct-name" });
+  assert.match(reply.body, /what would you like/i);
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Knee pain follow-up", messageId: "direct-reason" });
+  const timeId = reply.buttons.find((button) => button.id.startsWith("AI_TIME_")).id;
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Time", replyId: timeId, messageId: "direct-time" });
+  assert.equal(reply.buttons[0].id, "AI_REPORTS_YES");
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "No reports", replyId: "AI_REPORTS_NO", messageId: "direct-reports" });
+  assert.match(reply.body, /Visit Summary/i);
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Correct", replyId: "AI_SUMMARY_OK", messageId: "direct-summary" });
+  assert.match(reply.body, /consent/i);
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Yes", replyId: "AI_CONSENT_YES", messageId: "direct-consent" });
+  assert.equal(reply.buttons[0].id, "AI_BOOK_CONFIRM");
   const session = await ConversationSession.findOne({ phoneE164: phone });
-  assert.equal(session.state, "BOOKING_REVIEW");
+  assert.equal(session.state, "BOOKING_CONFIRM");
   return session;
 }
 
@@ -111,7 +114,7 @@ test.before(async () => {
 test.after(async () => {
   if (server) await new Promise((resolve) => server.close(resolve));
   await mongoose.disconnect();
-  await mongod.stop();
+  if (mongod) await mongod.stop();
 });
 
 test.beforeEach(async () => {
@@ -122,12 +125,12 @@ test.beforeEach(async () => {
     Appointment.deleteMany({}), AuditLog.deleteMany({}), BookingRequest.deleteMany({}),
     ConversationSession.deleteMany({}), MessageDeliveryStatus.deleteMany({}), Patient.deleteMany({}),
     PatientConsent.deleteMany({}), ReminderJob.deleteMany({}), RescheduleHistory.deleteMany({}),
-    WhatsAppMessage.deleteMany({}), Counter.deleteMany({})
+    WhatsAppMessage.deleteMany({}), Counter.deleteMany({}), EmergencyAlert.deleteMany({})
   ]);
   await ClinicLocation.updateMany({}, { $set: { blockedDates: [], blockedSlots: [] } });
 });
 
-test("webhook verification, signatures, text and Book Appointment reply IDs work", async () => {
+test("webhook verification, signatures, greeting and natural booking work", async () => {
   const verification = await fetch(`${baseUrl}/api/whatsapp/webhook?hub.mode=subscribe&hub.verify_token=whatsapp-verify-token&hub.challenge=321`);
   assert.equal(verification.status, 200);
   assert.equal(await verification.text(), "321");
@@ -137,37 +140,89 @@ test("webhook verification, signatures, text and Book Appointment reply IDs work
   const greeting = await postWebhook(incomingWebhook({ id: "wamid.hi", text: "Hi" }));
   assert.equal(greeting.status, 200);
   await waitFor(() => WhatsAppMessage.exists({ metaMessageId: "wamid.hi" }));
-  await waitFor(() => metaRequests.some((request) => request.payload.type === "interactive" && request.payload.interactive.type === "list"));
+  await waitFor(() => metaRequests.some((request) => request.payload.type === "text" && /Smart Clinic Assistant/.test(request.payload.text.body)));
 
-  const booking = await postWebhook(incomingWebhook({ id: "wamid.book", replyId: "MENU_BOOK", replyTitle: "Book Appointment" }));
+  const booking = await postWebhook(incomingWebhook({ id: "wamid.book", text: "I need an appointment on Monday" }));
   assert.equal(booking.status, 200);
-  const session = await waitFor(() => ConversationSession.findOne({ phoneE164: "+923001234567", state: "BOOKING_LOCATION" }));
+  const session = await waitFor(() => ConversationSession.findOne({ phoneE164: "+923001234567", state: "BOOKING_NAME" }));
   assert.ok(session);
-  await waitFor(() => metaRequests.some((request) => request.payload.interactive?.action?.sections?.[0]?.rows?.some((row) => row.id.startsWith("BOOK_LOCATION_"))));
+  await waitFor(() => metaRequests.some((request) => request.payload.type === "text" && /full name/i.test(request.payload.text.body)));
+});
+
+test("secure report upload is offered once after selecting a real slot", async () => {
+  const phone = "+923001234567";
+  await handleIncomingMessage({ phoneE164: phone, text: "Appointment Monday", messageId: "upload-start" });
+  await handleIncomingMessage({ phoneE164: phone, text: "Report Test Patient", messageId: "upload-name" });
+  let reply = await handleIncomingMessage({ phoneE164: phone, text: "Shoulder pain", messageId: "upload-reason" });
+  const timeId = reply.buttons.find((button) => button.id.startsWith("AI_TIME_")).id;
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Time", replyId: timeId, messageId: "upload-time" });
+  assert.match(reply.body, /PDF, JPEG, or PNG/i);
+  assert.deepEqual(reply.buttons.map((button) => button.id), ["AI_REPORTS_YES", "AI_REPORTS_NO"]);
 });
 
 test("invalid and expired WhatsApp conversation selections fail safely", async () => {
   const phone = "+923001234567";
-  let reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "CONFIRM_BOOKING", messageId: "invalid-confirm" });
-  assert.match(reply.body, /invalid|expired/i);
+  let reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "AI_BOOK_CONFIRM", messageId: "invalid-confirm" });
+  assert.match(reply.body, /tell me|appointment|reception/i);
   assert.equal(await Appointment.countDocuments(), 0);
 
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Book", replyId: "MENU_BOOK", messageId: "invalid-menu" });
-  const locationId = reply.sections[0].rows.find((row) => row.id.startsWith("BOOK_LOCATION_")).id;
-  await handleIncomingMessage({ phoneE164: phone, text: "Clinic", replyId: locationId, messageId: "invalid-location" });
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Old date", replyId: "BOOK_DATE_2020-01-01", messageId: "expired-date" });
-  assert.match(reply.body, /closed|blocked|expired|no longer available/i);
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "I need an appointment on 2020-01-01", messageId: "expired-date" });
+  assert.match(reply.body, /full name/i);
   assert.equal(await Appointment.countDocuments(), 0);
+});
+
+test("emergency language stops automation and creates a visible privacy-safe alert", async () => {
+  const phone = "+923001234567";
+  const response = await handleIncomingMessage({ phoneE164: phone, text: "He has chest pain and cannot breathe", messageId: "emergency-1" });
+  assert.match(response.body, /emergency|urgent/i);
+  const session = await ConversationSession.findOne({ phoneE164: phone });
+  assert.equal(session.state, "EMERGENCY_STOP");
+  const alert = await EmergencyAlert.findOne({ phoneE164: phone });
+  assert.equal(alert.status, "open");
+  assert.doesNotMatch(alert.alertMessage, /chest pain|cannot breathe/i);
+  assert.equal(await Appointment.countDocuments(), 0);
+});
+
+test("patient-requested human handoff is visible and pauses AI", async () => {
+  const phone = "+923001234567";
+  const response = await handleIncomingMessage({ phoneE164: phone, text: "I want to talk to a receptionist", messageId: "handoff-1" });
+  assert.match(response.body, /connecting/i);
+  const session = await ConversationSession.findOne({ phoneE164: phone });
+  assert.equal(session.aiPaused, true);
+  assert.equal(session.humanRequired, true);
+  assert.match(session.handoffReason, /requested/i);
+});
+
+test("appointment ID alone never exposes another patient's visit", async () => {
+  const bwp = await ClinicLocation.findOne({ code: "BWP" });
+  const dates = await require("../src/services/availabilityService").getAvailableDates("BWP", 60);
+  const slots = await require("../src/services/availabilityService").getAvailableSlots("BWP", dates[0].date);
+  const appointment = await createAppointment({
+    fullName: "Synthetic Owner", phone: "+923001234567", reason: "Follow-up", date: dates[0].date,
+    time: slots.find((slot) => slot.available).time, locationId: bwp.code, consentGiven: true
+  }, { source: "whatsapp", idempotencyKey: "privacy-owner", skipNotification: true });
+  const response = await handleIncomingMessage({
+    phoneE164: "+923009999999", text: `Status of ${appointment.appointmentId}`, messageId: "privacy-attacker"
+  });
+  assert.match(response.body, /couldn.t verify/i);
+  assert.doesNotMatch(response.body, new RegExp(appointment.date));
+  assert.doesNotMatch(response.body, new RegExp(appointment.time));
 });
 
 test("full WhatsApp booking uses the shared engine and a duplicated final webhook creates exactly one appointment", async () => {
   await reachBookingReview();
-  const finalEvent = incomingWebhook({ id: "wamid.confirm.once", replyId: "CONFIRM_BOOKING", replyTitle: "Confirm Booking" });
+  const finalEvent = incomingWebhook({ id: "wamid.confirm.once", replyId: "AI_BOOK_CONFIRM", replyTitle: "Confirm Appointment" });
   assert.equal((await postWebhook(finalEvent)).status, 200);
-  const appointment = await waitFor(() => Appointment.findOne({ phoneE164: "+923001234567" }));
+  const appointment = await waitFor(() => Appointment.findOne({
+    phoneE164: "+923001234567",
+    "patientProvidedVisitSummary.patientName": "WhatsApp Test Patient"
+  }));
   assert.ok(appointment.appointmentId.startsWith("DS-"));
   assert.ok(appointment.activeSlotKey);
   assert.equal(appointment.source, "whatsapp");
+  assert.equal(appointment.patientProvidedVisitSummary.patientName, "WhatsApp Test Patient");
+  assert.ok(appointment.patientProvidedVisitSummary.approvedAt);
+  assert.match(appointment.patientProvidedVisitSummary.disclaimer, /not an AI diagnosis/i);
   assert.equal((await PatientConsent.findById(appointment.consent)).consentGiven, true);
   await waitFor(() => WhatsAppMessage.exists({ templateName: "dr_sohaib_appointment_confirmation_v1", status: "queued" }));
 
@@ -180,15 +235,13 @@ test("full WhatsApp booking uses the shared engine and a duplicated final webhoo
 
 test("WhatsApp cancellation and rescheduling use secure phone ownership and configured templates", async () => {
   const phone = "+923001234567";
-  const review = await reachBookingReview(phone);
-  await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "CONFIRM_BOOKING", messageId: "direct-confirm" });
+  await reachBookingReview(phone);
+  await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "AI_BOOK_CONFIRM", messageId: "direct-confirm" });
   let appointment = await Appointment.findOne({ phoneE164: phone });
-
-  let reply = await handleIncomingMessage({ phoneE164: phone, text: "Manage", replyId: "MENU_MANAGE", messageId: "manage-1" });
-  const cancelId = reply.sections[0].rows.find((row) => row.id.startsWith("MANAGE_CANCEL_")).id;
-  await handleIncomingMessage({ phoneE164: phone, text: "Cancel", replyId: cancelId, messageId: "cancel-1" });
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "CONFIRM_CANCEL", messageId: "cancel-2" });
-  assert.equal(reply.notificationQueued, true);
+  let reply = await handleIncomingMessage({ phoneE164: phone, text: `Cancel appointment ${appointment.appointmentId}`, messageId: "cancel-1" });
+  assert.equal(reply.buttons[0].id, "AI_CANCEL_CONFIRM");
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "AI_CANCEL_CONFIRM", messageId: "cancel-2" });
+  assert.match(reply.body, /cancelled/i);
   appointment = await Appointment.findById(appointment._id);
   assert.equal(appointment.status, "cancelled");
   assert.ok(await WhatsAppMessage.exists({ templateName: "dr_sohaib_cancellation_confirmation_v1" }));
@@ -200,20 +253,18 @@ test("WhatsApp cancellation and rescheduling use secure phone ownership and conf
     fullName: "WhatsApp Test Patient", phone, reason: "General", date: dates[0].date,
     time: slots.find((slot) => slot.available).time, locationId: bwp.code, consentGiven: true
   }, { source: "whatsapp", idempotencyKey: "second-booking", skipNotification: true });
-  await handleIncomingMessage({ phoneE164: phone, text: "Menu", messageId: "reset" });
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Manage", replyId: "MENU_MANAGE", messageId: "manage-2" });
-  const rescheduleId = reply.sections[0].rows.find((row) => row.id.startsWith("MANAGE_RESCHEDULE_")).id;
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Reschedule", replyId: rescheduleId, messageId: "reschedule-1" });
-  const locationId = reply.sections[0].rows.find((row) => row.id.startsWith("RESCHEDULE_LOCATION_")).id;
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Clinic", replyId: locationId, messageId: "reschedule-2" });
-  const differentDate = reply.sections[0].rows.find((row) => row.id.startsWith("RESCHEDULE_DATE_") && !row.id.endsWith(appointment.date));
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Date", replyId: differentDate.id, messageId: "reschedule-3" });
-  const slotId = reply.sections[0].rows.find((row) => row.id.startsWith("RESCHEDULE_SLOT_")).id;
-  await handleIncomingMessage({ phoneE164: phone, text: "Time", replyId: slotId, messageId: "reschedule-4" });
-  reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "CONFIRM_RESCHEDULE", messageId: "reschedule-5" });
-  assert.equal(reply.notificationQueued, true);
+  const targetDate = dates.find((item) => item.date !== appointment.date).date;
+  reply = await handleIncomingMessage({ phoneE164: phone, text: `Reschedule ${appointment.appointmentId} to ${targetDate}`, messageId: "reschedule-1" });
+  assert.ok(reply.buttons, JSON.stringify(reply));
+  assert.ok(reply.buttons.some((button) => button.id.startsWith("AI_RESCHEDULE_TIME_")));
+  const newTimeId = reply.buttons.find((button) => button.id.startsWith("AI_RESCHEDULE_TIME_")).id;
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "New time", replyId: newTimeId, messageId: "reschedule-2" });
+  assert.equal(reply.buttons[0].id, "AI_RESCHEDULE_CONFIRM");
+  reply = await handleIncomingMessage({ phoneE164: phone, text: "Confirm", replyId: "AI_RESCHEDULE_CONFIRM", messageId: "reschedule-3" });
+  assert.match(reply.body, /now scheduled/i);
   appointment = await Appointment.findById(appointment._id);
   assert.equal(appointment.status, "rescheduled");
+  assert.equal(appointment.date, targetDate);
   assert.ok(await WhatsAppMessage.exists({ templateName: "dr_sohaib_reschedule_confirmation_v1" }));
 });
 

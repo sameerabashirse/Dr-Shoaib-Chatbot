@@ -18,6 +18,7 @@ const schema = z.object({
   timezone: z.string().min(3), slotDurationMinutes: z.number().int().min(5).max(240),
   sameDayBookingCutoffMinutes: z.number().int().min(0).max(1440),
   appointmentFee: z.number().min(0).optional(), displayOrder: z.number().int().optional(),
+  currentDelayMinutes: z.number().int().min(0).max(480).optional(),
   weeklyHours: z.array(z.object({
     day: z.number().int().min(1).max(7),
     isOpen: z.boolean(),
@@ -62,7 +63,10 @@ router.post("/", requireAuth, requirePermission("locations.manage"), asyncHandle
 }));
 router.put("/:id", requireAuth, requirePermission("locations.manage"), requireObjectIdParam("id", "Clinic location was not found."), asyncHandler(async (req, res) => {
   const parsed = schema.partial().safeParse(req.body); if (!parsed.success) throw badRequest("Validation failed", parsed.error.flatten());
-  const result = await updateLocation(req.params.id, parsed.data, { confirmExistingAppointments: parsed.data.confirmExistingAppointments === true });
+  const result = await updateLocation(req.params.id, parsed.data, {
+    confirmExistingAppointments: parsed.data.confirmExistingAppointments === true,
+    staffUser: req.user
+  });
   const location = result.location;
   await audit({ actorType: "staff", action: "location.updated", entityType: "location", entityId: String(location._id), req });
   res.json({ success: true, location, conflictingAppointmentsPreserved: result.conflictingAppointmentsPreserved });
